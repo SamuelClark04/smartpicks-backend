@@ -2,7 +2,13 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
+from fastapi import FastAPI
 
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
