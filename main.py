@@ -1,89 +1,89 @@
 # main.py
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse, PlainTextResponse
+from typing import Optional, List, Dict, Any
 import os
-from datetime import datetime, timezone
-from fastapi import FastAPI, Query, HTTPException
-import httpx
+import uvicorn
+from datetime import datetime
 
-app = FastAPI(title="SmartPicks Backend", version="1.0")
+app = FastAPI(title="SmartPicks backend v1")
 
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
-ODDS_BASE = "https://api.the-odds-api.com/v4"
+# ---- Models your iOS client decodes ----
+# (We just return dicts; no strict pydantic models so we never 422.)
+# APIEvent:
+#   id, sport_key, sport_title, commence_time, home_team, away_team, bookmakers:[{ key, title, last_update, markets:[{ key, outcomes:[{ name, price, point, description }] }] }]
 
-# ---- Health & root -----------------------------------------------------------
-@app.get("/")
-def root():
-    return {"service": "smartpicks-backend", "ok": True}
+def _iso_now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
-
-# ---- Helpers ----------------------------------------------------------------
-LEAGUE_MAP = {
-    # the iOS app sends league codes like these:
-    "nba": "basketball_nba",
-    "nfl": "americanfootball_nfl",
-    "ncaa_football": "americanfootball_ncaaf",
-    "mlb": "baseball_mlb",
-    "nhl": "icehockey_nhl",
-}
-
-def resolve_league(league_or_sport: str) -> str:
-    """Allow both league=mlb and sport=baseball_mlb."""
-    key = league_or_sport.lower()
-    if key in LEAGUE_MAP:         # league form
-        return LEAGUE_MAP[key]
-    # already a sport key (e.g. baseball_mlb)? accept as-is
-    return key
-
-async def fetch_events_from_oddsapi(sport_key: str, date: str | None, market: str):
-    if not ODDS_API_KEY:
-        # No key set -> behave gracefully with empty list
-        return []
-
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "us",
-        "markets": market,   # "player_props" or "h2h" etc
-        "oddsFormat": "american",
-        "dateFormat": "iso",
-    }
-    # TheOddsAPI doesn’t support explicit calendar date filtering directly for all endpoints.
-    # We’ll call the sport events endpoint and let the client filter by date.
-    url = f"{ODDS_BASE}/sports/{sport_key}/odds"
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(url, params=params)
-        if r.status_code == 404:
-            return []  # nothing for that sport/market
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        return r.json()
-
-# ---- Endpoints the app calls -------------------------------------------------
-@app.get("/api/odds")
-async def api_odds(
-    league: str | None = Query(None),
-    sport: str | None = Query(None),
-    date: str | None = Query(None),          # YYYY-MM-DD
-    market: str = Query("player_props"),
-):
-    league_param = league or sport
-    if not league_param:
-        raise HTTPException(422, detail="Provide ?league= or ?sport=")
-    sport_key = resolve_league(league_param)
-    data = await fetch_events_from_oddsapi(sport_key, date, market)
-    return data
+def health() -> PlainTextResponse:
+    return PlainTextResponse("ok", status_code=200)
 
 @app.get("/api/upcoming")
-async def api_upcoming(
-    league: str | None = Query(None),
-    sport: str | None = Query(None),
-    market: str = Query("player_props"),
-):
-    league_param = league or sport
-    if not league_param:
-        raise HTTPException(422, detail="Provide ?league= or ?sport=")
-    sport_key = resolve_league(league_param)
-    data = await fetch_events_from_oddsapi(sport_key, None, market)
-    return data
+def upcoming(
+    league: Optional[str] = Query(None, description="nba, nfl, mlb, nhl, ncaa_football, etc."),
+    sport: Optional[str] = Query(None, description="accept for leniency e.g. baseball_mlb"),
+    market: Optional[str] = Query(None, description="player_props, moneyline, etc."),
+) -> JSONResponse:
+    # Be lenient: accept league OR sport; normalize to league-ish
+    league_code = (league or "").strip().lower() or (sport or "").strip().lower()
+    market = (market or "player_props").strip().lower()
+
+    print(f"[UPCOMING] league={league_code!r} market={market!r}")
+
+    # TODO: plug real provider here and build events list.
+    # For now return an empty list so the app can render without errors.
+    events: List[Dict[str, Any]] = []
+
+    return JSONResponse(events, status_code=200)
+
+@app.get("/api/odds")
+def odds(
+    league: Optional[str] = Query(None),
+    sport: Optional[str] = Query(None),
+    date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    market: Optional[str] = Query(None),
+) -> JSONResponse:
+    league_code = (league or "").strip().lower() or (sport or "").strip().lower()
+    market = (market or "player_props").strip().lower()
+    date_str = (date or "").strip()
+
+    print(f"[ODDS] league={league_code!r} date={date_str!r} market={market!r}")
+
+    # Validate date gently (do not 422)
+    if date_str:
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            print(f"[ODDS] bad date '{date_str}', proceeding with empty result")
+
+    # TODO: fetch real odds and map to the shape below.
+    # Minimal sample (commented) if you want to see a row render:
+    # events = [{
+    #   "id": "evt_demo_1",
+    #   "sport_key": league_code or "demo",
+    #   "sport_title": (league_code or "Demo").upper(),
+    #   "commence_time": _iso_now(),
+    #   "home_team": "Home Team",
+    #   "away_team": "Away Team",
+    #   "bookmakers": [{
+    #       "key": "fanduel",
+    #       "title": "FanDuel",
+    #       "last_update": _iso_now(),
+    #       "markets": [{
+    #           "key": "player_points",
+    #           "outcomes": [
+    #               {"name":"Over", "price": -115, "point": 24.5, "description":"Player A"},
+    #               {"name":"Under","price": -105, "point": 24.5, "description":"Player A"}
+    #           ]
+    #       }]
+    #   }]
+    # }]
+    events: List[Dict[str, Any]] = []
+
+    return JSONResponse(events, status_code=200)
+
+# ---- Local run (Render uses the CMD below) ----
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
