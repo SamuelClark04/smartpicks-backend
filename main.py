@@ -1,58 +1,3 @@
-Absolutely—here’s a quick, no-fluff status of what’s in your current app (based on the ContentView.swift you shared), what works, what’s missing, and what to improve. Then I give you a drop-in main.py for the Render backend that matches your iOS models, supports multiple markets (props + moneyline/spread/total), and exposes a /api/signals endpoint for correlation/news-style boosters.
-
-What’s in the app right now (and working)
-	•	Tabs present: Picks, Props Browser (MVP), AI Builder, Planner v2 (bankroll → two primaries + safety, variable legs), Heat Map, Settings.
-	•	Bet Slip: FanDuel-style bar + panel on the Picks tab (safeAreaInset + sheet), with EV, hit %, decimal odds, payout, correlation callouts within the slip, and suggested correlated adds.
-	•	Correlation engine scaffolding:
-	•	CorrelationSignal model + signalsByEventId
-	•	async fetch from /api/signals?event_id=...
-	•	local fallback generator buildDerivedSignals()
-	•	pairing logic: correlationScore, correlationReason, marketPairBoost, suggestionsFor(leg:)
-	•	AI Builder v2: lets you choose leg count, then optimizes using confidence + correlation with a diversity penalty tuned by Risk Mode.
-	•	Planner v2: builds 2 primaries + 1 safety as singles or parlays, sizes stakes, shows Hit%, Dec Odds, Payout, EV, and can add to the slip.
-	•	Heat Map: grid by player × key stat markets, 🔥 for hot, 🥶 for cold, game picker included.
-	•	Odds fetch: robust client with logging, cache, dual routes (/api/odds//api/upcoming), dual param names (league/sport), local-day + fallback-day.
-
-What’s missing / bugs to fix
-	1.	Global correlation rules constant
-Code references CORRELATION_RULES in marketPairBoost(_:_:), but that dictionary isn’t in this file. If it’s not in another file, you’ll get a compile error or a silent “no reason” in the UI.
-➜ Add the large CORRELATION_RULES dictionary you pasted earlier at file top scope.
-	2.	Duplicate signals fetch (wasted work; can stutter)
-In AppVM.refresh() you call fetchSignalsIfAvailable twice. Keep the first block; delete the second.
-	3.	Multi-market fetching not implemented
-fetchAllProps still uses:
-
-let marketParam = (markets?.first ?? "player_props")
-
-That means you’re only ever hitting one market at a time (usually props).
-➜ Replace with a loop over multiple markets (e.g. "player_props,h2h,spreads,totals"), or parallelize. (I gave you a paste-ready version earlier.)
-
-	4.	Props Browser doesn’t expose team markets
-The local fallback ends at NHL props and omits "h2h","spreads","totals".
-➜ Add those keys and make sure MarketKey.label maps them to Moneyline / Spread / Total.
-	5.	Bet Slip bar only on Picks
-It won’t follow you into Props/Builder/Planner/Heat Map.
-➜ Extract a BetSlipOverlay view modifier and apply it to every tab.
-	6.	PickRow correlation hint not active in Picks
-You defined PickRow(pick:addAction: vm:) but PicksHome is still calling it without vm, so the “Best match: … 68%” line won’t appear.
-➜ Pass vm: vm where you render rows.
-	7.	AI Builder “news/injuries”/matchup logic
-The UI is wired for signals, but real news/injury/matchup signals depend on backend /api/signals. Right now you have a fallback heuristic.
-➜ Implement /api/signals on your backend (below).
-
-⸻
-
-Backend main.py (Render): FastAPI, multi-market odds + signals
-
-This file matches your iOS JSON models, supports multi-market (props + moneyline/spread/total), and provides /api/signals with domain-rule and heuristic correlation boosters. It also supports a FAKE_MODE for development until real provider keys are set.
-
-Notes
-• Set env vars on Render: ODDS_API_KEY (if you use a provider), FAKE_MODE=true while testing.
-• The code is structured so you can swap fetch_from_provider() with your real data source(s).
-• JSON schema mirrors your Swift APIEvent/APIBookmaker/APIMarket/APIOutcome.
-• CORS enabled for your app.
-• Returns one merged event list; markets/bookmakers are de-duped and sorted (FanDuel first).
-
 # main.py
 import os, time, random, hashlib
 from datetime import datetime, timedelta, timezone
@@ -361,15 +306,3 @@ def get_signals(event_id: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
-
-⸻
-
-What to do next (fastest wins)
-	1.	Add the CORRELATION_RULES dictionary (the full one you pasted) at top-level in your Swift file (or a new CorrelationRules.swift) so marketPairBoost actually returns reasons/bonuses.
-	2.	Fix duplicate signal fetch (delete the second block in refresh()).
-	3.	Enable multi-market in iOS fetcher (loop or parallelize over ["player_props","h2h","spreads","totals"]) and expose team markets in Props Browser (+ add labels in MarketKey.label).
-	4.	Make the Bet Slip global (extract an overlay modifier and apply on all tabs), and pass vm: vm to PickRow everywhere you render it so correlation hints show.
-	5.	Deploy the main.py to Render (set FAKE_MODE=true at first). Once your provider is wired, flip off FAKE mode and fill fetch_from_provider() with real calls and field mappings.
-
-If you’d like, I can also provide the minimal Swift patches (small diffs) for steps 1–4 in a single block so you can paste once.
