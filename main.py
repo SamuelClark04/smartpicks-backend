@@ -1862,4 +1862,4 @@ def _mlb_guess_abbr(name: str) -> str:
         return initials
     return n[:3].upper()
 def _mlb_event_abbrs(ev: APIEvent) -> List[str]:
-    return [_mlb_guess_a<truncated__content/>
+    return [_mlb_guess_abbr(ev.home_team), _mlb_guess_abbr(ev.away_team)]
