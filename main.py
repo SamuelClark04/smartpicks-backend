@@ -251,10 +251,10 @@ def parse_markets(market: Optional[str]) -> List[str]:
     if "all" in m: return ["player_props","h2h","spreads","totals"]
     return m
 
-@app.get("/healthz")
+@app.get("/health")
 def healthz():
     return {"ok": True, "ts": now_iso(), "fake": FAKE_MODE}
-
+    
 @app.get("/api/odds", response_model=List[APIEvent])
 def get_odds(
     league: Optional[str] = None,
