@@ -437,6 +437,59 @@ def _filter_markets_for_sport(requested_csv: str, sport_key: str) -> str:
         filtered = list({"h2h","spreads","totals"})
     return ",".join(filtered)
 
+# ---- OddsAPI market chunk/merge helpers ----
+def _split_markets(csv: str, chunk_size: int = 5) -> List[str]:
+    items = [m.strip() for m in (csv or "").split(",") if m.strip()]
+    return [",".join(items[i:i+chunk_size]) for i in range(0, len(items), chunk_size)]
+
+def _merge_market_lists(a: List[APIMarket], b: List[APIMarket]) -> List[APIMarket]:
+    # merge by market.key, de-duping outcomes by (name, point, description)
+    by_key: Dict[str, APIMarket] = {m.key: APIMarket(key=m.key, outcomes=list(m.outcomes)) for m in a}
+    for m in b:
+        if m.key not in by_key:
+            by_key[m.key] = APIMarket(key=m.key, outcomes=list(m.outcomes))
+        else:
+            seen = {(o.name, o.point, o.description) for o in by_key[m.key].outcomes}
+            for o in m.outcomes:
+                key = (o.name, o.point, o.description)
+                if key not in seen:
+                    by_key[m.key].outcomes.append(o)
+                    seen.add(key)
+    return list(by_key.values())
+
+def _merge_bookmakers(a: List[APIBookmaker], b: List[APIBookmaker]) -> List[APIBookmaker]:
+    by_key: Dict[str, APIBookmaker] = {bk.key: APIBookmaker(key=bk.key, title=bk.title, last_update=bk.last_update, markets=list(bk.markets)) for bk in a}
+    for bk in b:
+        if bk.key not in by_key:
+            by_key[bk.key] = APIBookmaker(key=bk.key, title=bk.title, last_update=bk.last_update, markets=list(bk.markets))
+        else:
+            merged_markets = _merge_market_lists(by_key[bk.key].markets, bk.markets)
+            by_key[bk.key] = APIBookmaker(
+                key=by_key[bk.key].key,
+                title=by_key[bk.key].title if by_key[bk.key].title else bk.title,
+                last_update=bk.last_update or by_key[bk.key].last_update,
+                markets=merged_markets
+            )
+    return list(by_key.values())
+
+def _merge_events(a: List[APIEvent], b: List[APIEvent]) -> List[APIEvent]:
+    by_id: Dict[str, APIEvent] = {e.id: APIEvent(**e.dict()) for e in a}
+    for e in b:
+        if e.id not in by_id:
+            by_id[e.id] = APIEvent(**e.dict())
+        else:
+            merged_bk = _merge_bookmakers(by_id[e.id].bookmakers, e.bookmakers)
+            by_id[e.id] = APIEvent(
+                id=by_id[e.id].id,
+                sport_key=by_id[e.id].sport_key or e.sport_key,
+                sport_title=by_id[e.id].sport_title or e.sport_title,
+                commence_time=by_id[e.id].commence_time or e.commence_time,
+                home_team=by_id[e.id].home_team or e.home_team,
+                away_team=by_id[e.id].away_team or e.away_team,
+                bookmakers=merged_bk
+            )
+    return list(by_id.values())
+
 def _ckey(*parts) -> str:
     return "|".join(str(p) for p in parts if p is not None)
 
@@ -464,57 +517,84 @@ async def fetch_odds_events(
     """
     Calls The Odds API and normalizes results into your Swift JSON shape.
     Returns (events, upstream_headers) so we can forward x-requests-remaining.
+
+    Change: batch markets to avoid 422s and gracefully fall back to team markets if upstream rejects a set.
     """
     if not ODDS_API_KEY:
         raise HTTPException(status_code=401, detail="Server missing ODDS_API_KEY")
 
+    # Filter by sport and then split into small chunks to stay under provider limits
+    filtered_markets = _filter_markets_for_sport(markets_csv, sport_key)
+    chunks = _split_markets(filtered_markets, chunk_size=5)
+
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
-    params = {
+    common = {
         "apiKey": ODDS_API_KEY,
         "regions": "us",
         "oddsFormat": "american",
-        "markets": _filter_markets_for_sport(markets_csv, sport_key),
         "bookmakers": ",".join(bookmakers or DEFAULT_BOOKMAKERS),
     }
 
-    r = await http.get(url, params=params, timeout=30)
-    if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
+    merged_events: List[APIEvent] = []
+    last_headers: Dict[str, str] = {}
 
-    raw = r.json()
-    upstream_headers = {k.lower(): v for k, v in r.headers.items()}
-
-    events: List[APIEvent] = []
-    for e in raw:
-        bks: List[APIBookmaker] = []
-        for b in e.get("bookmakers", []) or []:
-            mkts: List[APIMarket] = []
-            for m in b.get("markets", []) or []:
-                outs: List[APIOutcome] = []
-                for o in m.get("outcomes", []) or []:
-                    outs.append(APIOutcome(
-                        name=str(o.get("name", "")),
-                        price=float(o.get("price", 0) or 0),
-                        point=o.get("point"),
-                        description=o.get("description"),
-                    ))
-                mkts.append(APIMarket(key=str(m.get("key","")), outcomes=outs))
-            bks.append(APIBookmaker(
-                key=str(b.get("key","")),
-                title=(b.get("title") or b.get("key") or "").strip(),
-                last_update=str(b.get("last_update") or ""),   # non-optional for Swift
-                markets=mkts
+    async def _one_call(markets: str) -> Tuple[List[APIEvent], Dict[str, str]]:
+        r = await http.get(url, params={**common, "markets": markets}, timeout=30)
+        # If upstream returns 422 for this set, raise so caller can decide to fall back
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        raw = r.json()
+        hdrs = {k.lower(): v for k, v in r.headers.items()}
+        evs: List[APIEvent] = []
+        for e in raw:
+            bks: List[APIBookmaker] = []
+            for b in e.get("bookmakers", []) or []:
+                mkts: List[APIMarket] = []
+                for m in b.get("markets", []) or []:
+                    outs: List[APIOutcome] = []
+                    for o in m.get("outcomes", []) or []:
+                        outs.append(APIOutcome(
+                            name=str(o.get("name", "")),
+                            price=float(o.get("price", 0) or 0),
+                            point=o.get("point"),
+                            description=o.get("description"),
+                        ))
+                    mkts.append(APIMarket(key=str(m.get("key","")), outcomes=outs))
+                bks.append(APIBookmaker(
+                    key=str(b.get("key","")),
+                    title=(b.get("title") or b.get("key") or "").strip(),
+                    last_update=str(b.get("last_update") or ""),
+                    markets=mkts
+                ))
+            evs.append(APIEvent(
+                id=str(e.get("id","")),
+                sport_key=sport_key,
+                sport_title=HUMAN_TITLES.get(sport_key, str(e.get("sport_title") or "")),
+                commence_time=str(e.get("commence_time") or ""),
+                home_team=str(e.get("home_team") or ""),
+                away_team=str(e.get("away_team") or ""),
+                bookmakers=bks
             ))
-        events.append(APIEvent(
-            id=str(e.get("id","")),
-            sport_key=sport_key,
-            sport_title=HUMAN_TITLES.get(sport_key, str(e.get("sport_title") or "")),
-            commence_time=str(e.get("commence_time") or ""),
-            home_team=str(e.get("home_team") or ""),
-            away_team=str(e.get("away_team") or ""),
-            bookmakers=bks
-        ))
-    return events, upstream_headers
+        return evs, hdrs
+
+    # Try chunked calls first; if any chunk 422s, fall back to team markets only
+    try:
+        for mk_chunk in chunks:
+            evs, hdrs = await _one_call(mk_chunk)
+            merged_events = _merge_events(merged_events, evs)
+            last_headers = hdrs
+    except HTTPException as e:
+        if e.status_code == 422:
+            # graceful fallback to team-only markets to avoid total failure
+            team_only = "h2h,spreads,totals"
+            evs, hdrs = await _one_call(team_only)
+            merged_events = _merge_events(merged_events, evs)
+            last_headers = hdrs
+        else:
+            # bubble up other failures
+            raise
+
+    return merged_events, last_headers
 
 def filter_by_date(events: List[APIEvent], date_yyyy_mm_dd: Optional[str]) -> List[APIEvent]:
     """Optional server-side filter (the app also filters locally)."""
