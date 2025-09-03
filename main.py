@@ -390,6 +390,53 @@ ALL_MARKETS = ",".join([
     "player_shots_on_goal","player_goals","player_points","goalie_saves"
 ])
 
+# Per-sport market allowlists (to avoid 422 from The Odds API when requesting unsupported markets)
+SPORT_MARKETS: Dict[str, List[str]] = {
+    "basketball_nba": [
+        "h2h","spreads","totals",
+        "player_points","player_rebounds","player_assists","player_threes",
+        "player_steals","player_blocks","player_turnovers",
+        "player_points_rebounds_assists","player_points_rebounds",
+        "player_points_assists","player_rebounds_assists",
+    ],
+    "americanfootball_nfl": [
+        "h2h","spreads","totals",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_receiving_tds",
+        "player_longest_reception","player_longest_rush",
+    ],
+    "americanfootball_ncaaf": [
+        "h2h","spreads","totals",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_receiving_tds",
+        "player_longest_reception","player_longest_rush",
+    ],
+    "baseball_mlb": [
+        "h2h","spreads","totals",
+        "player_hits","player_runs","player_rbis","player_home_runs","player_total_bases","player_walks",
+        "player_strikeouts","pitcher_outs","pitcher_hits_allowed",
+    ],
+    "icehockey_nhl": [
+        "h2h","spreads","totals",
+        "player_shots_on_goal","player_goals","player_assists","player_points","goalie_saves",
+    ],
+}
+
+def _filter_markets_for_sport(requested_csv: str, sport_key: str) -> str:
+    """Intersect requested markets with sport-allowed list to prevent upstream 422s."""
+    requested = [m.strip() for m in (requested_csv or "").split(",") if m.strip()]
+    allowed = set(SPORT_MARKETS.get(sport_key, []))
+    # default to generic team markets if sport not found
+    if not allowed:
+        allowed = {"h2h","spreads","totals"}
+    filtered = [m for m in requested if m in allowed]
+    # if nothing matched, fall back to generic team markets
+    if not filtered:
+        filtered = list({"h2h","spreads","totals"})
+    return ",".join(filtered)
+
 def _ckey(*parts) -> str:
     return "|".join(str(p) for p in parts if p is not None)
 
@@ -426,7 +473,7 @@ async def fetch_odds_events(
         "apiKey": ODDS_API_KEY,
         "regions": "us",
         "oddsFormat": "american",
-        "markets": markets_csv,
+        "markets": _filter_markets_for_sport(markets_csv, sport_key),
         "bookmakers": ",".join(bookmakers or DEFAULT_BOOKMAKERS),
     }
 
