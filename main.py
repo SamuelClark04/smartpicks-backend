@@ -110,7 +110,7 @@ class CorrelationSignal(BaseModel):
 # ------------------------------------------------------------
 # FastAPI app + CORS
 # ------------------------------------------------------------
-app = FastAPI(title="SmartPicks Backend", version="1.0.0")
+app = FastAPI(title="SmartPicks Backend", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -362,7 +362,12 @@ HUMAN_TITLES = {
     "icehockey_nhl": "NHL",
 }
 
-DEFAULT_BOOKMAKERS = ["fanduel", "draftkings", "betmgm", "caesars"]
+DEFAULT_BOOKMAKERS = [
+    "fanduel","draftkings","betmgm","caesars",
+    "pointsbetus","betrivers","barstool","bovada",
+    "bet365","williamhill_us","betway","superbook",
+    "prizepicks","underdog"
+]
 # Optional public stat APIs (used for real H2H signals)
 BALLDONTLIE_API_BASE = "https://www.balldontlie.io/api/v1"
 BALLDONTLIE_API_KEY = os.getenv("BALLDONTLIE_API_KEY", "").strip()  # optional
@@ -553,11 +558,42 @@ async def fetch_odds_events(
                 for m in b.get("markets", []) or []:
                     outs: List[APIOutcome] = []
                     for o in m.get("outcomes", []) or []:
+                        _name = str(o.get("name", "")).strip()
+                        _desc = o.get("description")
+
+                        # Some providers only include the player in alternate fields.
+                        # Try a broader set of common keys when description is missing.
+                        if not _desc and _name.lower() in ("over", "under"):
+                            for k in (
+                                "participant", "player", "team", "runner", "competitor",
+                                "participant_name", "playerName", "athlete", "entity"
+                            ):
+                                val = o.get(k)
+                                if val:
+                                    _desc = str(val).strip()
+                                    break
+
+                        # A few feeds put the player in "participant" and "name" holds the player
+                        # directly (not Over/Under). If we still have no description, but there is a
+                        # plausible player field, keep it in description to satisfy the Swift UI.
+                        if not _desc:
+                            for k in ("participant", "player", "playerName"):
+                                val = o.get(k)
+                                if val:
+                                    _desc = str(val).strip()
+                                    break
+
+                        # Normalize price to float even if provided as string
+                        try:
+                            _price = float(o.get("price", 0) or 0)
+                        except Exception:
+                            _price = 0.0
+
                         outs.append(APIOutcome(
-                            name=str(o.get("name", "")),
-                            price=float(o.get("price", 0) or 0),
+                            name=_name,
+                            price=_price,
                             point=o.get("point"),
-                            description=o.get("description"),
+                            description=_desc,
                         ))
                     mkts.append(APIMarket(key=str(m.get("key","")), outcomes=outs))
                 bks.append(APIBookmaker(
@@ -567,7 +603,7 @@ async def fetch_odds_events(
                     markets=mkts
                 ))
             evs.append(APIEvent(
-                id=str(e.get("id","")),
+                id=_event_fallback_id(e),
                 sport_key=sport_key,
                 sport_title=HUMAN_TITLES.get(sport_key, str(e.get("sport_title") or "")),
                 commence_time=str(e.get("commence_time") or ""),
@@ -615,6 +651,16 @@ def filter_by_date(events: List[APIEvent], date_yyyy_mm_dd: Optional[str]) -> Li
 # ------------------------------------------------------------
 def _stable_id(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
+    
+def _event_fallback_id(raw: dict) -> str:
+    parts = [
+        str(raw.get("id") or ""),
+        str(raw.get("commence_time") or ""),
+        str(raw.get("home_team") or ""),
+        str(raw.get("away_team") or "")
+    ]
+    base = "||".join(parts).strip()
+    return (raw.get("id") or hashlib.md5(base.encode()).hexdigest())
 
 def _fake_team_id(name: str) -> int:
     return int(hashlib.md5(name.encode()).hexdigest()[:6], 16)
