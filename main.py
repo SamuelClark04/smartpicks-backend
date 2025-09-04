@@ -755,7 +755,8 @@ async def fetch_odds_events(
 
     # Filter by sport and then split into small chunks to stay under provider limits
     filtered_markets = _filter_markets_for_sport(markets_csv, sport_key)
-
+    # props-friendly defaults
+    PROPS_BOOKS = ["draftkings","fanduel","betmgm","caesars","bet365"]
     # unified string of books, reuse later for cache key & store
     books_str = ",".join(bookmakers or DEFAULT_BOOKMAKERS)
 
@@ -787,8 +788,16 @@ async def fetch_odds_events(
     merged_events: List[APIEvent] = []
     last_headers: Dict[str, str] = {}
 
-    async def _one_call(markets: str, no_bookmakers: bool = False) -> Tuple[List[APIEvent], Dict[str, str]]:
+        async def _one_call(markets: str, no_bookmakers: bool = False) -> Tuple[List[APIEvent], Dict[str, str]]:
         params = {**common, "markets": markets}
+
+        # If this chunk has any player/pitcher market, force a props-safe call:
+        has_props = ("player_" in markets) or ("pitcher_" in markets)
+        if has_props:
+            params["regions"] = "us"  # props are most commonly in US books
+            if not no_bookmakers:
+                params["bookmakers"] = ",".join(PROPS_BOOKS)
+
         if no_bookmakers:
             params.pop("bookmakers", None)
         r = await http.get(url, params=params, timeout=30)
@@ -876,9 +885,24 @@ async def fetch_odds_events(
             merged_events = _merge_events(merged_events, evs)
             last_headers = hdrs
             success_chunks += 1
-        except HTTPException as e:
+                except HTTPException as e:
             if e.status_code in (400, 404, 422):
+                # print the rejected body for visibility
+                try:
+                    # quick probe to fetch the raw body for this exact request once
+                    probe_params = {**common, "markets": mk_chunk}
+                    if ("player_" in mk_chunk) or ("pitcher_" in mk_chunk):
+                        probe_params["regions"] = "us"
+                        probe_params["bookmakers"] = ",".join(PROPS_BOOKS)
+                    if no_bookmakers:
+                        probe_params.pop("bookmakers", None)
+                    probe = await http.get(url, params=probe_params, timeout=30)
+                    print(f"[fetch_odds_events] {e.status_code} body for '{mk_chunk}': {probe.text[:400]}")
+                except Exception as _e:
+                    print(f"[fetch_odds_events] could not log body for '{mk_chunk}': {_e}")
+
                 if e.status_code == 422:
+                    # Retry without any bookmakers in case a specific book blocks props
                     try:
                         evs, hdrs = await _one_call(mk_chunk, no_bookmakers=True)
                         merged_events = _merge_events(merged_events, evs)
