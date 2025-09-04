@@ -38,6 +38,7 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 CFBD_API_KEY = os.getenv("CFBD_API_KEY", "").strip()  # placeholder for later
 ALLOW_ORIGINS = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",") if o.strip()]
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+ODDS_REGIONS = os.getenv("ODDS_REGIONS", "us,us2,eu").strip()
 
 # ------------------------------------------------------------
 # Caching layer (simple TTL in-memory)
@@ -76,6 +77,7 @@ class APIOutcome(BaseModel):
     price: float
     point: Optional[float] = None
     description: Optional[str] = None
+    model_prob: Optional[float] = None  # de‑vig normalized probability within an outcome group
 
 class APIMarket(BaseModel):
     key: str
@@ -390,7 +392,7 @@ ALL_MARKETS = ",".join([
     "player_receiving_tds","player_longest_reception","player_longest_rush",
     # MLB
     "player_hits","player_runs","player_rbis","player_home_runs","player_total_bases","player_walks",
-    "player_strikeouts","pitcher_outs","pitcher_hits_allowed",
+    "player_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
     # NHL
     "player_shots_on_goal","player_goals","player_points","goalie_saves"
 ])
@@ -421,7 +423,7 @@ SPORT_MARKETS: Dict[str, List[str]] = {
     "baseball_mlb": [
         "h2h","spreads","totals",
         "player_hits","player_runs","player_rbis","player_home_runs","player_total_bases","player_walks",
-        "player_strikeouts","pitcher_outs","pitcher_hits_allowed",
+        "player_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
     ],
     "icehockey_nhl": [
         "h2h","spreads","totals",
@@ -498,6 +500,16 @@ def _merge_events(a: List[APIEvent], b: List[APIEvent]) -> List[APIEvent]:
 def _ckey(*parts) -> str:
     return "|".join(str(p) for p in parts if p is not None)
 
+# ---- American odds to implied probability helper ----
+def _american_to_implied(price: float) -> float:
+    try:
+        p = float(str(price).strip())
+        if p < 0:
+            return (-p) / ((-p) + 100.0)
+        return 100.0 / (p + 100.0)
+    except Exception:
+        return 0.0
+
 def normalize_market_param(market: Optional[str]) -> str:
     if not market or market.lower() == "all":
         return ALL_MARKETS
@@ -535,7 +547,7 @@ async def fetch_odds_events(
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
     common = {
         "apiKey": ODDS_API_KEY,
-        "regions": "us",
+        "regions": ODDS_REGIONS,
         "oddsFormat": "american",
         "bookmakers": ",".join(bookmakers or DEFAULT_BOOKMAKERS),
     }
@@ -543,8 +555,11 @@ async def fetch_odds_events(
     merged_events: List[APIEvent] = []
     last_headers: Dict[str, str] = {}
 
-    async def _one_call(markets: str) -> Tuple[List[APIEvent], Dict[str, str]]:
-        r = await http.get(url, params={**common, "markets": markets}, timeout=30)
+    async def _one_call(markets: str, no_bookmakers: bool = False) -> Tuple[List[APIEvent], Dict[str, str]]:
+        params = {**common, "markets": markets}
+        if no_bookmakers:
+            params.pop("bookmakers", None)
+        r = await http.get(url, params=params, timeout=30)
         # If upstream returns 422 for this set, raise so caller can decide to fall back
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=r.text)
@@ -556,34 +571,29 @@ async def fetch_odds_events(
             for b in e.get("bookmakers", []) or []:
                 mkts: List[APIMarket] = []
                 for m in b.get("markets", []) or []:
+                    # --- build outcomes first (with safe description mapping) ---
                     outs: List[APIOutcome] = []
                     for o in m.get("outcomes", []) or []:
                         _name = str(o.get("name", "")).strip()
-                        _desc = o.get("description")
-
-                        # Some providers only include the player in alternate fields.
-                        # Try a broader set of common keys when description is missing.
+                        # Improved player description inference
+                        # Normalize/guess player description across books
+                        _desc = o.get("description") or o.get("player") or o.get("playerName")
                         if not _desc and _name.lower() in ("over", "under"):
+                            # Try a variety of common fields different books use
                             for k in (
-                                "participant", "player", "team", "runner", "competitor",
-                                "participant_name", "playerName", "athlete", "entity"
+                                "participant","runner","competitor","team",
+                                "participant_name","athlete","entity","label","selection",
                             ):
                                 val = o.get(k)
                                 if val:
                                     _desc = str(val).strip()
                                     break
-
-                        # A few feeds put the player in "participant" and "name" holds the player
-                        # directly (not Over/Under). If we still have no description, but there is a
-                        # plausible player field, keep it in description to satisfy the Swift UI.
                         if not _desc:
-                            for k in ("participant", "player", "playerName"):
-                                val = o.get(k)
-                                if val:
-                                    _desc = str(val).strip()
-                                    break
+                            # Some books nest under 'outcome' → 'description' or 'player'
+                            d = o.get("outcome") or {}
+                            _desc = d.get("description") or d.get("player") or _desc
 
-                        # Normalize price to float even if provided as string
+                        # Normalize price to float
                         try:
                             _price = float(o.get("price", 0) or 0)
                         except Exception:
@@ -593,8 +603,30 @@ async def fetch_odds_events(
                             name=_name,
                             price=_price,
                             point=o.get("point"),
-                            description=_desc,
+                            description=_desc or "",
+                            model_prob=None,
                         ))
+
+                    # --- compute de‑vig probabilities within logical groups ---
+                    # Group outcomes by (point, description) for O/U & player props; fallback to (point,) or by market overall.
+                    groups: Dict[Tuple, List[int]] = {}
+                    for idx, oc in enumerate(outs):
+                        key = None
+                        if oc.point is not None and oc.description:
+                            key = (round(float(oc.point), 3), oc.description.strip().lower())
+                        elif oc.point is not None:
+                            key = (round(float(oc.point), 3),)
+                        else:
+                            key = ("all",)
+                        groups.setdefault(key, []).append(idx)
+
+                    for _, idxs in groups.items():
+                        # sum implied probs and normalize
+                        implieds = [max(1e-6, _american_to_implied(outs[i].price)) for i in idxs]
+                        s = sum(implieds) if sum(implieds) > 1e-9 else 1.0
+                        for i, imp in zip(idxs, implieds):
+                            outs[i].model_prob = float(imp / s)
+
                     mkts.append(APIMarket(key=str(m.get("key","")), outcomes=outs))
                 bks.append(APIBookmaker(
                     key=str(b.get("key","")),
@@ -613,22 +645,67 @@ async def fetch_odds_events(
             ))
         return evs, hdrs
 
-    # Try chunked calls first; if any chunk 422s, fall back to team markets only
-    try:
-        for mk_chunk in chunks:
+    # Per-chunk try/except, count successes, and only fall back to team-only if all chunks failed
+    last_headers: Dict[str, str] = {}
+    success_chunks = 0
+    for mk_chunk in chunks:
+        try:
             evs, hdrs = await _one_call(mk_chunk)
             merged_events = _merge_events(merged_events, evs)
             last_headers = hdrs
-    except HTTPException as e:
-        if e.status_code == 422:
-            # graceful fallback to team-only markets to avoid total failure
+            success_chunks += 1
+        except HTTPException as e:
+            # Skip bad market groups (e.g., provider doesn’t support a subset)
+            if e.status_code in (400, 404, 422):
+                print(f"[fetch_odds_events] Skipping unsupported markets chunk='{mk_chunk}' status={e.status_code}")
+                continue
+            # Bubble up other failures
+            raise
+    # If none of the chunks succeeded, fall back to team-only markets
+    if success_chunks == 0:
+        try:
             team_only = "h2h,spreads,totals"
             evs, hdrs = await _one_call(team_only)
             merged_events = _merge_events(merged_events, evs)
             last_headers = hdrs
-        else:
-            # bubble up other failures
+        except HTTPException as e:
+            # If even team-only fails, propagate the error
             raise
+
+    # Secondary fallback: if we got only team markets (no player_* or pitcher_* keys),
+    # retry the same chunks WITHOUT restricting bookmakers and with a lighter market set.
+    have_player = False
+    for ev in merged_events:
+        for bk in ev.bookmakers:
+            for mk in bk.markets:
+                if mk.key.startswith("player_") or mk.key.startswith("pitcher_"):
+                    have_player = True
+                    break
+            if have_player: break
+        if have_player: break
+    if not have_player:
+        light_by_sport = {
+            "basketball_nba": ["player_points","player_rebounds","player_assists","player_threes"],
+            "americanfootball_nfl": ["player_pass_yards","player_rush_yards","player_receiving_yards","player_receptions"],
+            "americanfootball_ncaaf": ["player_pass_yards","player_rush_yards","player_receiving_yards","player_receptions"],
+            "baseball_mlb": ["player_total_bases","player_hits","player_home_runs","pitcher_strikeouts","pitcher_outs"],
+            "icehockey_nhl": ["player_shots_on_goal","player_points","player_goals","player_assists"],
+        }
+        light = light_by_sport.get(sport_key, [])
+        if light:
+            merged_events = []
+            last_headers = {}
+            light_chunks = _split_markets(",".join(light), chunk_size=4)
+            for mk_chunk in light_chunks:
+                try:
+                    evs, hdrs = await _one_call(mk_chunk, no_bookmakers=True)
+                    merged_events = _merge_events(merged_events, evs)
+                    last_headers = hdrs
+                except HTTPException as e:
+                    if e.status_code in (400,404,422):
+                        print(f"[fetch_odds_events] Light retry (no_bookmakers) skipped chunk='{mk_chunk}' status={e.status_code}")
+                        continue
+                    raise
 
     return merged_events, last_headers
 
@@ -1215,7 +1292,7 @@ def _odds_impl(
 ):
     sport_key = map_league_or_sport(league, sport)
     markets_csv = normalize_market_param(market)
-    ck = _ckey("odds", sport_key, date or "upcoming", markets_csv)
+    ck = _ckey("odds", sport_key, date or "upcoming", markets_csv, ODDS_REGIONS)
 
     cached = cache.get(ck)
     if cached is not None:
@@ -1247,7 +1324,7 @@ def api_odds(
     league: Optional[str] = Query(None),
     sport: Optional[str] = Query(None),
     date: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    market: Optional[str] = Query("all")
+    market: Optional[str] = Query("all", description="CSV of markets; 'all' requests team + player props")
 ):
     return _odds_impl(league, sport, date, market, response)
 
@@ -1256,7 +1333,7 @@ def api_upcoming(
     response: Response,
     league: Optional[str] = Query(None),
     sport: Optional[str] = Query(None),
-    market: Optional[str] = Query("all")
+    market: Optional[str] = Query("all", description="CSV of markets; 'all' requests team + player props")
 ):
     return _odds_impl(league, sport, None, market, response)
 
@@ -1267,7 +1344,7 @@ def odds_alias(
     league: Optional[str] = Query(None),
     sport: Optional[str] = Query(None),
     date: Optional[str] = Query(None),
-    market: Optional[str] = Query("all")
+    market: Optional[str] = Query("all", description="CSV of markets; 'all' requests team + player props")
 ):
     return _odds_impl(league, sport, date, market, response)
 
@@ -1276,9 +1353,10 @@ def upcoming_alias(
     response: Response,
     league: Optional[str] = Query(None),
     sport: Optional[str] = Query(None),
-    market: Optional[str] = Query("all")
+    market: Optional[str] = Query("all", description="CSV of markets; 'all' requests team + player props")
 ):
     return _odds_impl(league, sport, None, market, response)
+
 
 @app.get("/api/signals", response_model=List[CorrelationSignal])
 def api_signals(
@@ -1328,3 +1406,126 @@ def api_signals(
         return []  # not fatal; app treats signals as optional
 
     return anyio.run(_ensure_fetch_and_find)
+
+
+# ------------------------------------------------------------
+# /api/corr: Lightweight on-demand correlation signals for slip
+# ------------------------------------------------------------
+@app.get("/api/corr", response_model=List[CorrelationSignal])
+def api_corr(
+    event_id: str = Query(..., description="Event id from /api/odds"),
+    players: str = Query("", description="comma-separated player names in slip for this event"),
+    markets: Optional[str] = Query(None, description="optional comma list of market keys to focus"),
+    league: Optional[str] = Query(None),
+    sport: Optional[str] = Query(None),
+):
+    """
+    Lightweight, on-demand correlations that the app can call after a leg is added.
+    - Reuses the same CorrelationSignal schema as /api/signals so the UI can merge them.
+    - Conservative caps (±0.08) to avoid over-influence.
+    """
+    # helper: find event in cache (mirrors logic inside /api/signals)
+    def _scan_cached_for_event(skey: Optional[str]) -> Optional[APIEvent]:
+        keys_to_check = []
+        if skey:
+            keys_to_check.append(_ckey("odds", skey, "upcoming", ALL_MARKETS))
+        else:
+            for sk in ("basketball_nba","americanfootball_nfl","americanfootball_ncaaf","baseball_mlb","icehockey_nhl"):
+                keys_to_check.append(_ckey("odds", sk, "upcoming", ALL_MARKETS))
+        for ck in keys_to_check:
+            cached = cache.get(ck)
+            if not cached:
+                continue
+            events, _ = cached
+            for ev in events:
+                if str(ev.id) == str(event_id):
+                    return ev
+        return None
+
+    sport_key = map_league_or_sport(league, sport) if (league or sport) else None
+    ev = _scan_cached_for_event(sport_key)
+
+    if not ev:
+        # Best-effort fetch of upcoming for the guessed sport, then try to find the event
+        import anyio, httpx as _hx
+        async def _ensure_fetch_and_find() -> Optional[APIEvent]:
+            skey = sport_key or "basketball_nba"
+            async with _hx.AsyncClient() as http:
+                events, _ = await fetch_odds_events(http, skey, ALL_MARKETS)
+                cache.set(_ckey("odds", skey, "upcoming", ALL_MARKETS), (events, {}))
+            for e in events:
+                if str(e.id) == str(event_id):
+                    return e
+            return None
+        ev = anyio.run(_ensure_fetch_and_find)
+
+    if not ev:
+        return []
+
+    # Start with the standard signals for this event (H2H/recent form adapters)
+    sigs: List[CorrelationSignal] = []
+    try:
+        sigs.extend(build_signals_for_event(ev))
+    except Exception as e:
+        print(f"/api/corr base build error: {e}")
+
+    # Augment with slip-aware, bounded correlations
+    names = [p.strip() for p in (players or "").split(",") if p.strip()]
+    wanted = set(m.strip() for m in (markets or "").split(",") if m) if markets else None
+
+    # Rule A: same-player, multi-market → small role-stability boost
+    for n in names:
+        mk = list(wanted) if wanted else [
+            "player_points","player_assists","player_rebounds","player_threes",
+            "player_pass_yards","player_receiving_yards","player_rush_yards",
+            "player_total_bases","player_hits","player_shots_on_goal"
+        ]
+        if mk:
+            sigs.append(CorrelationSignal(
+                id=_stable_id(f"same_player|{ev.id}|{n}"),
+                kind="news",
+                eventId=ev.id,
+                players=[n],
+                teams=[],
+                markets=mk,
+                boost=0.04,
+                reason=f"{n}: consistent role across markets (recent form proxy)"
+            ))
+
+    # Rule B: scorer + facilitator pairing (NBA-ish) → mild bump
+    if len(names) >= 2 and (ev.sport_key.lower() in ("basketball_nba","nba")):
+        for i in range(len(names)):
+            for j in range(i+1, len(names)):
+                a, b = names[i], names[j]
+                if not wanted:
+                    sigs.append(CorrelationSignal(
+                        id=_stable_id(f"scorer_fac|{ev.id}|{a}|{b}"),
+                        kind="team_style",
+                        eventId=ev.id,
+                        players=[a, b],
+                        teams=[],
+                        markets=["player_points","player_assists"],
+                        boost=0.06,
+                        reason="High-usage scorer + facilitator in same game"
+                    ))
+
+    # Rule C: tiny game-wide tailwind (kept very small)
+    sigs.append(CorrelationSignal(
+        id=_stable_id(f"game_tailwind|{ev.id}"),
+        kind="pace_injury",
+        eventId=ev.id,
+        players=[],
+        teams=[],
+        markets=[],
+        boost=0.03,
+        reason="Game-wide pace/injury tailwind (bounded)"
+    ))
+
+    # Cap boosts conservatively and de-duplicate by id
+    capped: Dict[str, CorrelationSignal] = {}
+    # (safety) cap boosts to ±0.08
+    for s in sigs:
+        s.boost = float(max(-0.08, min(0.08, s.boost)))
+        capped[s.id] = s
+
+    return list(capped.values())
