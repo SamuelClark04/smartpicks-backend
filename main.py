@@ -755,12 +755,13 @@ async def fetch_odds_events(
 
     # Filter by sport and then split into small chunks to stay under provider limits
     filtered_markets = _filter_markets_for_sport(markets_csv, sport_key)
-    cached_events = _odds_cache_get(sport_key, "upcoming", filtered_markets, ODDS_REGIONS, _books)
-    if cached_events:
-        try:
-            return [APIEvent(**e) for e in cached_events], {}
-        except Exception:
-            pass
+    books_str = ",".join(bookmakers or DEFAULT_BOOKMAKERS)
+cached_events = _odds_cache_get(sport_key, "upcoming", filtered_markets, ODDS_REGIONS, books_str)
+if cached_events:
+    try:
+        return [APIEvent(**e) for e in cached_events], {}
+    except Exception:
+        pass
     chunks = _split_markets(filtered_markets, chunk_size=3)
 
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
@@ -940,7 +941,7 @@ async def fetch_odds_events(
 
     try:
         # Persist a fresh snapshot for reuse; we tag ymd as 'upcoming' since date filtering is done later
-        _odds_cache_put(sport_key, "upcoming", filtered_markets, ODDS_REGIONS, ",".join(bookmakers or DEFAULT_BOOKMAKERS), merged_events)
+        _odds_cache_put(sport_key, "upcoming", filtered_markets, ODDS_REGIONS, books_str, merged_events)
     except Exception as _e:
         print(f"[odds_cache_put] non-fatal error: {_e}")
     return merged_events, last_headers
