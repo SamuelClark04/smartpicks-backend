@@ -30,6 +30,11 @@ import httpx
 from fastapi import FastAPI, Query, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import sqlite3
+import gzip
+from pathlib import Path
+import urllib.parse
+from contextlib import contextmanager
 
 # ------------------------------------------------------------
 # Environment / Config
@@ -38,7 +43,162 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 CFBD_API_KEY = os.getenv("CFBD_API_KEY", "").strip()  # placeholder for later
 ALLOW_ORIGINS = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",") if o.strip()]
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
-ODDS_REGIONS = os.getenv("ODDS_REGIONS", "us,us2,eu").strip()
+ODDS_REGIONS = os.getenv("ODDS_REGIONS", "us").strip()
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "smartpicks.sqlite"
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+IS_PG = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+
+# Lazy import for Postgres so local SQLite still works without extra deps
+_psycopg = None
+if IS_PG:
+    try:
+        import psycopg
+        _psycopg = psycopg
+    except Exception as e:
+        # We will raise a clear error later on first DB access if psycopg is missing
+        _psycopg = e  # store exception to report nicely
+
+@contextmanager
+def db_conn():
+    """Context manager that yields a connection with autocommit for PG and row factory for sqlite."""
+    if IS_PG:
+        if isinstance(_psycopg, Exception):
+            raise RuntimeError(
+                "DATABASE_URL is set but psycopg is not installed. Add 'psycopg[binary]' to requirements.txt."
+            )
+        conn = _psycopg.connect(DATABASE_URL, autocommit=True)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+# Helpers for SQL param style differences
+def qmark(sql: str) -> str:
+    """Convert sqlite style '?' placeholders to Postgres '%s' if needed."""
+    if IS_PG:
+        # naive but safe: replace '?' that are used as value placeholders
+        parts = sql.split('?')
+        return '%s'.join(parts)
+    return sql
+
+def _init_db():
+    with db_conn() as conn:
+        cur = conn.cursor()
+        if IS_PG:
+            # Enable extensions if desired (not required); keep DDL idempotent
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS odds_snapshots (
+                  id SERIAL PRIMARY KEY,
+                  sport TEXT NOT NULL,
+                  ymd TEXT NOT NULL,
+                  markets TEXT NOT NULL,
+                  regions TEXT NOT NULL,
+                  bookmakers TEXT NOT NULL,
+                  fetched_at BIGINT NOT NULL,
+                  body_gz BYTEA NOT NULL,
+                  UNIQUE(sport, ymd, markets, regions, bookmakers)
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS player_game_stats (
+                  id SERIAL PRIMARY KEY,
+                  league TEXT NOT NULL,
+                  game_date TEXT NOT NULL,
+                  player TEXT NOT NULL,
+                  team TEXT,
+                  opp TEXT,
+                  minutes DOUBLE PRECISION,
+                  pts DOUBLE PRECISION, ast DOUBLE PRECISION, reb DOUBLE PRECISION, fg3m DOUBLE PRECISION,
+                  stl DOUBLE PRECISION, blk DOUBLE PRECISION, tov DOUBLE PRECISION,
+                  rush_yd DOUBLE PRECISION, rec_yd DOUBLE PRECISION, pass_yd DOUBLE PRECISION, sog DOUBLE PRECISION,
+                  UNIQUE(league, game_date, player)
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pair_corr (
+                  id SERIAL PRIMARY KEY,
+                  league TEXT NOT NULL,
+                  window TEXT NOT NULL,
+                  player_a TEXT NOT NULL,
+                  stat_a TEXT NOT NULL,
+                  player_b TEXT NOT NULL,
+                  stat_b TEXT NOT NULL,
+                  r DOUBLE PRECISION NOT NULL,
+                  n INTEGER NOT NULL,
+                  updated_at BIGINT NOT NULL,
+                  UNIQUE(league, window, player_a, stat_a, player_b, stat_b)
+                );
+                """
+            )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS odds_snapshots (
+                  id INTEGER PRIMARY KEY,
+                  sport TEXT NOT NULL,
+                  ymd TEXT NOT NULL,
+                  markets TEXT NOT NULL,
+                  regions TEXT NOT NULL,
+                  bookmakers TEXT NOT NULL,
+                  fetched_at INTEGER NOT NULL,
+                  body_gz BLOB NOT NULL,
+                  UNIQUE(sport, ymd, markets, regions, bookmakers)
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS player_game_stats (
+                  id INTEGER PRIMARY KEY,
+                  league TEXT NOT NULL,
+                  game_date TEXT NOT NULL,
+                  player TEXT NOT NULL,
+                  team TEXT,
+                  opp TEXT,
+                  minutes REAL,
+                  pts REAL, ast REAL, reb REAL, fg3m REAL,
+                  stl REAL, blk REAL, tov REAL,
+                  rush_yd REAL, rec_yd REAL, pass_yd REAL, sog REAL,
+                  UNIQUE(league, game_date, player)
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pair_corr (
+                  id INTEGER PRIMARY KEY,
+                  league TEXT NOT NULL,
+                  window TEXT NOT NULL,
+                  player_a TEXT NOT NULL,
+                  stat_a TEXT NOT NULL,
+                  player_b TEXT NOT NULL,
+                  stat_b TEXT NOT NULL,
+                  r REAL NOT NULL,
+                  n INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  UNIQUE(league, window, player_a, stat_a, player_b, stat_b)
+                );
+                """
+            )
+
+_init_db()
+
 
 # ------------------------------------------------------------
 # Caching layer (simple TTL in-memory)
@@ -68,6 +228,56 @@ class TTLCache:
         self.store[key] = (time.time(), value)
 
 cache = TTLCache(ttl_seconds=600)
+# === Odds disk-cache helpers (gzipped JSON in SQLite) ===
+def _odds_cache_key(sport_key: str, ymd: str, markets_csv: str, regions: str, books: str) -> tuple:
+    return (sport_key, ymd, markets_csv, regions, books)
+
+def _odds_cache_get(sport_key: str, ymd: str, markets_csv: str, regions: str, books: str, max_age_sec: int = 600):
+    ck = _odds_cache_key(sport_key, ymd, markets_csv, regions, books)
+    with db_conn() as conn:
+        cur = conn.cursor()
+        sql = qmark("SELECT fetched_at, body_gz FROM odds_snapshots WHERE sport=? AND ymd=? AND markets=? AND regions=? AND bookmakers=?")
+        cur.execute(sql, ck)
+        row = cur.fetchone()
+    if not row:
+        return None
+    fetched_at, body_gz = row
+    if time.time() - fetched_at > max_age_sec:
+        return None
+    try:
+        body = gzip.decompress(bytes(body_gz)) if IS_PG else gzip.decompress(body_gz)
+        payload = json.loads(body.decode("utf-8"))
+        return payload.get("events", [])
+    except Exception:
+        return None
+
+def _odds_cache_put(sport_key: str, ymd: str, markets_csv: str, regions: str, books: str, events: list):
+    ev_dicts = [e.dict() if hasattr(e, "dict") else e for e in events]
+    blob = gzip.compress(json.dumps({"events": ev_dicts}, separators=(",", ":")).encode("utf-8"))
+    ck = _odds_cache_key(sport_key, ymd, markets_csv, regions, books)
+    with db_conn() as conn:
+        cur = conn.cursor()
+        if IS_PG:
+            sql = qmark(
+                """
+                INSERT INTO odds_snapshots (sport, ymd, markets, regions, bookmakers, fetched_at, body_gz)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (sport, ymd, markets, regions, bookmakers)
+                DO UPDATE SET fetched_at = EXCLUDED.fetched_at, body_gz = EXCLUDED.body_gz
+                """
+            )
+            cur.execute(sql, (*ck, int(time.time()), blob))
+        else:
+            sql = qmark(
+                """
+                INSERT INTO odds_snapshots (sport, ymd, markets, regions, bookmakers, fetched_at, body_gz)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sport, ymd, markets, regions, bookmakers)
+                DO UPDATE SET fetched_at=excluded.fetched_at, body_gz=excluded.body_gz
+                """
+            )
+            cur.execute(sql, (*ck, int(time.time()), blob))
+
 
 # ------------------------------------------------------------
 # Pydantic models that MATCH your Swift Decodables (non-optionals included)
@@ -445,7 +655,7 @@ def _filter_markets_for_sport(requested_csv: str, sport_key: str) -> str:
     return ",".join(filtered)
 
 # ---- OddsAPI market chunk/merge helpers ----
-def _split_markets(csv: str, chunk_size: int = 5) -> List[str]:
+def _split_markets(csv: str, chunk_size: int = 3) -> List[str]:
     items = [m.strip() for m in (csv or "").split(",") if m.strip()]
     return [",".join(items[i:i+chunk_size]) for i in range(0, len(items), chunk_size)]
 
@@ -542,7 +752,13 @@ async def fetch_odds_events(
 
     # Filter by sport and then split into small chunks to stay under provider limits
     filtered_markets = _filter_markets_for_sport(markets_csv, sport_key)
-    chunks = _split_markets(filtered_markets, chunk_size=5)
+    cached_events = _odds_cache_get(sport_key, "upcoming", filtered_markets, ODDS_REGIONS, _books)
+    if cached_events:
+        try:
+            return [APIEvent(**e) for e in cached_events], {}
+        except Exception:
+            pass
+    chunks = _split_markets(filtered_markets, chunk_size=3)
 
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
     common = {
@@ -655,10 +871,22 @@ async def fetch_odds_events(
             last_headers = hdrs
             success_chunks += 1
         except HTTPException as e:
-            # Skip bad market groups (e.g., provider doesn’t support a subset)
             if e.status_code in (400, 404, 422):
-                print(f"[fetch_odds_events] Skipping unsupported markets chunk='{mk_chunk}' status={e.status_code}")
-                continue
+                if e.status_code == 422:
+                    # Retry the same chunk *without* restricting bookmakers. Some provider/book combos 422.
+                    try:
+                        evs, hdrs = await _one_call(mk_chunk, no_bookmakers=True)
+                        merged_events = _merge_events(merged_events, evs)
+                        last_headers = hdrs
+                        success_chunks += 1
+                        print(f"[fetch_odds_events] 422 retry succeeded without bookmakers for chunk='{mk_chunk}'")
+                        continue
+                    except HTTPException as e2:
+                        print(f"[fetch_odds_events] Skipping unsupported markets chunk='{mk_chunk}' status=422 (no_bookmakers retry failed {e2.status_code})")
+                        continue
+                else:
+                    print(f"[fetch_odds_events] Skipping unsupported markets chunk='{mk_chunk}' status={e.status_code}")
+                    continue
             # Bubble up other failures
             raise
     # If none of the chunks succeeded, fall back to team-only markets
@@ -707,6 +935,11 @@ async def fetch_odds_events(
                         continue
                     raise
 
+    try:
+        # Persist a fresh snapshot for reuse; we tag ymd as 'upcoming' since date filtering is done later
+        _odds_cache_put(sport_key, "upcoming", filtered_markets, ODDS_REGIONS, ",".join(bookmakers or DEFAULT_BOOKMAKERS), merged_events)
+    except Exception as _e:
+        print(f"[odds_cache_put] non-fatal error: {_e}")
     return merged_events, last_headers
 
 def filter_by_date(events: List[APIEvent], date_yyyy_mm_dd: Optional[str]) -> List[APIEvent]:
@@ -1305,6 +1538,16 @@ def _odds_impl(
         # server-side date filter is optional; app also filters by local day
         return filter_by_date(events, date)
 
+    # Try the on-disk snapshot cache for 'upcoming' (we store by 'upcoming', app also filters by date)
+    disk_evs = _odds_cache_get(sport_key, "upcoming", markets_csv, ODDS_REGIONS, ",".join(DEFAULT_BOOKMAKERS))
+    if disk_evs:
+        try:
+            events = [APIEvent(**e) for e in disk_evs]
+            cache.set(ck, (events, {}))
+            return filter_by_date(events, date)
+        except Exception:
+            pass
+
     async def _do_fetch():
         async with httpx.AsyncClient() as http:
             events, hdrs = await fetch_odds_events(http, sport_key, markets_csv)
@@ -1521,11 +1764,63 @@ def api_corr(
         reason="Game-wide pace/injury tailwind (bounded)"
     ))
 
+    # Optional: fold in any precomputed correlations from DB (bounded window)
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            sql = qmark("SELECT player_a, stat_a, player_b, stat_b, r, n FROM pair_corr WHERE league=? AND window=? LIMIT 200")
+            cur.execute(sql, (ev.sport_key, "recent"))
+            for (pa, sa, pb, sb, r, n) in cur.fetchall() or []:
+                if abs(float(r)) < 0.15 or int(n) < 8:
+                    continue
+                boost = max(-0.08, min(0.08, 0.20 * float(r)))
+                sigs.append(CorrelationSignal(
+                    id=_stable_id(f"dbcorr|{ev.id}|{pa}|{sa}|{pb}|{sb}"),
+                    kind="db_corr",
+                    eventId=ev.id,
+                    players=[pa, pb],
+                    teams=[],
+                    markets=[sa, sb],
+                    boost=float(boost),
+                    reason=f"DB correlations r={float(r):.2f} over n={int(n)}"
+                ))
+    except Exception as _e:
+        print(f"/api/corr db merge skipped: {_e}")
+
     # Cap boosts conservatively and de-duplicate by id
     capped: Dict[str, CorrelationSignal] = {}
     # (safety) cap boosts to ±0.08
     for s in sigs:
         s.boost = float(max(-0.08, min(0.08, s.boost)))
         capped[s.id] = s
+    dedup = {}
+    for s in sigs:
+        s.boost = float(max(-0.08, min(0.08, s.boost)))
+        dedup[s.id] = s
+    return list(dedup.values())
 
-    return list(capped.values())
+
+@app.post("/admin/backfill")
+def admin_backfill(league: str = "nba", days: int = 30):
+    """
+    Stub endpoint: integrate your stats feed here and call
+    `upsert_player_stat_row(...)` per player per game to build local correlations.
+    """
+    return {"ok": True, "league": league, "window_days": days, "rows": 0}
+
+
+# Admin: prune old odds snapshots to save storage
+@app.post("/admin/prune")
+def admin_prune(max_age_days: int = 14):
+    """Delete old odds snapshots older than N days to keep storage small."""
+    cutoff = int(time.time() - max_age_days * 86400)
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            if IS_PG:
+                cur.execute(qmark("DELETE FROM odds_snapshots WHERE fetched_at < ?"), (cutoff,))
+            else:
+                cur.execute("DELETE FROM odds_snapshots WHERE fetched_at < ?", (cutoff,))
+        return {"ok": True, "deleted_older_than_days": max_age_days}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
