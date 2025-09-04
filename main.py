@@ -746,21 +746,34 @@ async def fetch_odds_events(
 ) -> Tuple[List[APIEvent], Dict[str, str]]:
     """
     Calls The Odds API and normalizes results into your Swift JSON shape.
-    Returns (events, upstream_headers) so we can forward x-requests-remaining.
+    Returns (events, upstream_headers) so we can forward x-requests-remaining).
 
-    Change: batch markets to avoid 422s and gracefully fall back to team markets if upstream rejects a set.
+    Batches markets to avoid 422s and caches disk snapshots.
     """
     if not ODDS_API_KEY:
         raise HTTPException(status_code=401, detail="Server missing ODDS_API_KEY")
 
     # Filter by sport and then split into small chunks to stay under provider limits
     filtered_markets = _filter_markets_for_sport(markets_csv, sport_key)
-    cached_events = _odds_cache_get(sport_key, "upcoming", filtered_markets, ODDS_REGIONS, _books)
+
+    # unified string of books, reuse later for cache key & store
+    books_str = ",".join(bookmakers or DEFAULT_BOOKMAKERS)
+
+    # try disk snapshot cache first (stored under ymd='upcoming')
+    cached_events = _odds_cache_get(
+        sport_key,
+        "upcoming",
+        filtered_markets,
+        ODDS_REGIONS,
+        books_str
+    )
     if cached_events:
         try:
             return [APIEvent(**e) for e in cached_events], {}
         except Exception:
             pass
+
+    # chunk markets to avoid 422 limits upstream
     chunks = _split_markets(filtered_markets, chunk_size=3)
 
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
@@ -768,7 +781,7 @@ async def fetch_odds_events(
         "apiKey": ODDS_API_KEY,
         "regions": ODDS_REGIONS,
         "oddsFormat": "american",
-        "bookmakers": ",".join(bookmakers or DEFAULT_BOOKMAKERS),
+        "bookmakers": books_str,
     }
 
     merged_events: List[APIEvent] = []
@@ -779,40 +792,33 @@ async def fetch_odds_events(
         if no_bookmakers:
             params.pop("bookmakers", None)
         r = await http.get(url, params=params, timeout=30)
-        # If upstream returns 422 for this set, raise so caller can decide to fall back
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=r.text)
+
         raw = r.json()
         hdrs = {k.lower(): v for k, v in r.headers.items()}
         evs: List[APIEvent] = []
+
         for e in raw:
             bks: List[APIBookmaker] = []
             for b in e.get("bookmakers", []) or []:
                 mkts: List[APIMarket] = []
                 for m in b.get("markets", []) or []:
-                    # --- build outcomes first (with safe description mapping) ---
                     outs: List[APIOutcome] = []
                     for o in m.get("outcomes", []) or []:
                         _name = str(o.get("name", "")).strip()
-                        # Improved player description inference
-                        # Normalize/guess player description across books
-                        _desc = o.get("description") or o.get("player") or o.get("playerName")
+                        # try to recover a player/runner name consistently
+                        _desc = (
+                            o.get("description")
+                            or o.get("player") or o.get("playerName")
+                            or o.get("participant") or o.get("runner") or o.get("competitor")
+                            or o.get("participant_name") or o.get("athlete") or o.get("entity")
+                            or o.get("label") or o.get("selection")
+                        )
                         if not _desc and _name.lower() in ("over", "under"):
-                            # Try a variety of common fields different books use
-                            for k in (
-                                "participant","runner","competitor","team",
-                                "participant_name","athlete","entity","label","selection",
-                            ):
-                                val = o.get(k)
-                                if val:
-                                    _desc = str(val).strip()
-                                    break
-                        if not _desc:
-                            # Some books nest under 'outcome' → 'description' or 'player'
                             d = o.get("outcome") or {}
                             _desc = d.get("description") or d.get("player") or _desc
 
-                        # Normalize price to float
                         try:
                             _price = float(o.get("price", 0) or 0)
                         except Exception:
@@ -826,11 +832,9 @@ async def fetch_odds_events(
                             model_prob=None,
                         ))
 
-                    # --- compute de‑vig probabilities within logical groups ---
-                    # Group outcomes by (point, description) for O/U & player props; fallback to (point,) or by market overall.
+                    # de-vig within logical groups
                     groups: Dict[Tuple, List[int]] = {}
                     for idx, oc in enumerate(outs):
-                        key = None
                         if oc.point is not None and oc.description:
                             key = (round(float(oc.point), 3), oc.description.strip().lower())
                         elif oc.point is not None:
@@ -840,19 +844,20 @@ async def fetch_odds_events(
                         groups.setdefault(key, []).append(idx)
 
                     for _, idxs in groups.items():
-                        # sum implied probs and normalize
                         implieds = [max(1e-6, _american_to_implied(outs[i].price)) for i in idxs]
                         s = sum(implieds) if sum(implieds) > 1e-9 else 1.0
                         for i, imp in zip(idxs, implieds):
                             outs[i].model_prob = float(imp / s)
 
                     mkts.append(APIMarket(key=str(m.get("key","")), outcomes=outs))
+
                 bks.append(APIBookmaker(
                     key=str(b.get("key","")),
                     title=(b.get("title") or b.get("key") or "").strip(),
                     last_update=str(b.get("last_update") or ""),
                     markets=mkts
                 ))
+
             evs.append(APIEvent(
                 id=_event_fallback_id(e),
                 sport_key=sport_key,
@@ -864,8 +869,6 @@ async def fetch_odds_events(
             ))
         return evs, hdrs
 
-    # Per-chunk try/except, count successes, and only fall back to team-only if all chunks failed
-    last_headers: Dict[str, str] = {}
     success_chunks = 0
     for mk_chunk in chunks:
         try:
@@ -876,7 +879,6 @@ async def fetch_odds_events(
         except HTTPException as e:
             if e.status_code in (400, 404, 422):
                 if e.status_code == 422:
-                    # Retry the same chunk *without* restricting bookmakers. Some provider/book combos 422.
                     try:
                         evs, hdrs = await _one_call(mk_chunk, no_bookmakers=True)
                         merged_events = _merge_events(merged_events, evs)
@@ -885,35 +887,27 @@ async def fetch_odds_events(
                         print(f"[fetch_odds_events] 422 retry succeeded without bookmakers for chunk='{mk_chunk}'")
                         continue
                     except HTTPException as e2:
-                        print(f"[fetch_odds_events] Skipping unsupported markets chunk='{mk_chunk}' status=422 (no_bookmakers retry failed {e2.status_code})")
+                        print(f"[fetch_odds_events] Skipping unsupported markets chunk='{mk_chunk}' status=422 (retry failed {e2.status_code})")
                         continue
                 else:
                     print(f"[fetch_odds_events] Skipping unsupported markets chunk='{mk_chunk}' status={e.status_code}")
                     continue
-            # Bubble up other failures
-            raise
-    # If none of the chunks succeeded, fall back to team-only markets
-    if success_chunks == 0:
-        try:
-            team_only = "h2h,spreads,totals"
-            evs, hdrs = await _one_call(team_only)
-            merged_events = _merge_events(merged_events, evs)
-            last_headers = hdrs
-        except HTTPException as e:
-            # If even team-only fails, propagate the error
             raise
 
-    # Secondary fallback: if we got only team markets (no player_* or pitcher_* keys),
-    # retry the same chunks WITHOUT restricting bookmakers and with a lighter market set.
-    have_player = False
-    for ev in merged_events:
-        for bk in ev.bookmakers:
-            for mk in bk.markets:
-                if mk.key.startswith("player_") or mk.key.startswith("pitcher_"):
-                    have_player = True
-                    break
-            if have_player: break
-        if have_player: break
+    if success_chunks == 0:
+        try:
+            evs, hdrs = await _one_call("h2h,spreads,totals")
+            merged_events = _merge_events(merged_events, evs)
+            last_headers = hdrs
+        except HTTPException:
+            raise
+
+    # If we still have no player props, try a lighter set without restricting books
+    have_player = any(
+        any(mk.key.startswith("player_") or mk.key.startswith("pitcher_")
+            for bk in ev.bookmakers for mk in bk.markets)
+        for ev in merged_events
+    )
     if not have_player:
         light_by_sport = {
             "basketball_nba": ["player_points","player_rebounds","player_assists","player_threes"],
@@ -926,23 +920,29 @@ async def fetch_odds_events(
         if light:
             merged_events = []
             last_headers = {}
-            light_chunks = _split_markets(",".join(light), chunk_size=4)
-            for mk_chunk in light_chunks:
+            for mk_chunk in _split_markets(",".join(light), chunk_size=4):
                 try:
                     evs, hdrs = await _one_call(mk_chunk, no_bookmakers=True)
                     merged_events = _merge_events(merged_events, evs)
                     last_headers = hdrs
                 except HTTPException as e:
-                    if e.status_code in (400,404,422):
-                        print(f"[fetch_odds_events] Light retry (no_bookmakers) skipped chunk='{mk_chunk}' status={e.status_code}")
+                    if e.status_code in (400, 404, 422):
+                        print(f"[fetch_odds_events] Light retry skipped chunk='{mk_chunk}' status={e.status_code}")
                         continue
                     raise
 
     try:
-        # Persist a fresh snapshot for reuse; we tag ymd as 'upcoming' since date filtering is done later
-        _odds_cache_put(sport_key, "upcoming", filtered_markets, ODDS_REGIONS, ",".join(bookmakers or DEFAULT_BOOKMAKERS), merged_events)
+        _odds_cache_put(
+            sport_key,
+            "upcoming",
+            filtered_markets,
+            ODDS_REGIONS,
+            books_str,
+            merged_events
+        )
     except Exception as _e:
         print(f"[odds_cache_put] non-fatal error: {_e}")
+
     return merged_events, last_headers
 
 def filter_by_date(events: List[APIEvent], date_yyyy_mm_dd: Optional[str]) -> List[APIEvent]:
