@@ -29,7 +29,10 @@ from typing import Dict, List, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Query, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+# Pydantic v2: allow fields starting with "model_" (e.g., model_prob)
+class SPBase(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
 import sqlite3
 import gzip
 from pathlib import Path
@@ -282,24 +285,24 @@ def _odds_cache_put(sport_key: str, ymd: str, markets_csv: str, regions: str, bo
 # ------------------------------------------------------------
 # Pydantic models that MATCH your Swift Decodables (non-optionals included)
 # ------------------------------------------------------------
-class APIOutcome(BaseModel):
+class APIOutcome(SPBase):
     name: str
     price: float
     point: Optional[float] = None
     description: Optional[str] = None
     model_prob: Optional[float] = None  # de‑vig normalized probability within an outcome group
 
-class APIMarket(BaseModel):
+class APIMarket(SPBase):
     key: str
     outcomes: List[APIOutcome]
 
-class APIBookmaker(BaseModel):
+class APIBookmaker(SPBase):
     key: str
     title: str
     last_update: str   # non-optional in Swift
     markets: List[APIMarket]
 
-class APIEvent(BaseModel):
+class APIEvent(SPBase):
     id: str
     sport_key: str
     sport_title: str   # non-optional in Swift
@@ -309,7 +312,7 @@ class APIEvent(BaseModel):
     bookmakers: List[APIBookmaker]
 
 # Correlation signal model (for /api/signals) matching your Swift struct
-class CorrelationSignal(BaseModel):
+class CorrelationSignal(SPBase):
     id: str
     kind: str             # "head_to_head" | "matchup_trend" | ...
     eventId: str
