@@ -1085,12 +1085,12 @@ async def fetch_odds_events(
                 player_merged_by_book["aggregated"] = _merge_market_lists(player_merged_by_book["aggregated"], mkts)
 
             # Attach/merge into event's bookmakers
-            
             if not player_merged_by_book and FREE_SANDBOX:
                 synth = _sandbox_player_markets_for_sport(ev, sport_key, player_markets)
                 if synth:
                     player_merged_by_book["aggregated"] = synth
-if player_merged_by_book:
+
+            if player_merged_by_book:
                 agg_markets = player_merged_by_book["aggregated"]
                 # if there is already a bookmaker, append player markets to the first one; otherwise create one
                 if ev.bookmakers:
@@ -1101,7 +1101,9 @@ if player_merged_by_book:
                         markets=_merge_market_lists(ev.bookmakers[0].markets, agg_markets),
                     )
                 else:
-                    ev.bookmakers.append(APIBookmaker(key="agg", title="Aggregated", last_update="", markets=agg_markets))
+                    ev.bookmakers.append(
+                        APIBookmaker(key="agg", title="Aggregated", last_update="", markets=agg_markets)
+                    )
 
     # persist a compressed snapshot for reuse
     try:
