@@ -46,9 +46,9 @@ SPORT_ALLOWED_MARKETS = {
     ],
     "americanfootball_nfl": [
         "h2h","spreads","totals",
-        "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
-        "player_rush_yds","player_rush_attempts","player_rush_tds",
-        "player_reception_yds","player_receptions","player_reception_tds",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_reception_tds",
         "player_reception_longest","player_rush_longest",
     ],
     "baseball_mlb": [
@@ -62,9 +62,9 @@ SPORT_ALLOWED_MARKETS = {
     ],
     "americanfootball_ncaaf": [
         "h2h","spreads","totals",
-        "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
-        "player_rush_yds","player_rush_attempts","player_rush_tds",
-        "player_reception_yds","player_receptions","player_reception_tds",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_reception_tds",
         "player_reception_longest","player_rush_longest",
     ],
 }
@@ -390,6 +390,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---- FastAPI health and root endpoints ----
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.get("/")
+async def root():
+    return {"name": "SmartPicks Backend", "version": app.version}
+
 # ------------------------------------------------------------
 # Helpers & mappings
 # ------------------------------------------------------------
@@ -451,8 +460,8 @@ ALL_MARKETS = ",".join([
     "player_points","player_rebounds","player_assists","player_threes","player_steals","player_blocks","player_turnovers",
     "player_points_rebounds_assists","player_points_rebounds","player_points_assists","player_rebounds_assists",
     # NFL/CFB
-    "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
-    "player_rush_yds","player_rush_attempts","player_rush_tds","player_reception_yds","player_receptions",
+    "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+    "player_rush_yards","player_rush_attempts","player_rush_tds","player_receiving_yards","player_receptions",
     "player_reception_tds","player_reception_longest","player_rush_longest",
     # MLB
     "batter_hits","batter_runs_scored","batter_rbis","batter_home_runs","batter_total_bases","batter_walks",
@@ -709,8 +718,8 @@ ALL_MARKETS = ",".join([
     "player_points","player_rebounds","player_assists","player_threes","player_steals","player_blocks","player_turnovers",
     "player_points_rebounds_assists","player_points_rebounds","player_points_assists","player_rebounds_assists",
     # NFL/CFB
-    "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
-    "player_rush_yds","player_rush_attempts","player_rush_tds","player_reception_yds","player_receptions",
+    "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+    "player_rush_yards","player_rush_attempts","player_rush_tds","player_receiving_yards","player_receptions",
     "player_reception_tds","player_reception_longest","player_rush_longest",
     # MLB
     "batter_hits","batter_runs_scored","batter_rbis","batter_home_runs","batter_total_bases","batter_walks",
@@ -729,23 +738,22 @@ SPORT_MARKETS: Dict[str, List[str]] = {
     ],
     "americanfootball_nfl": [
         "h2h","spreads","totals",
-        "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
-        "player_rush_yds","player_rush_attempts","player_rush_tds",
-        "player_reception_yds","player_receptions","player_reception_tds",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_reception_tds",
         "player_reception_longest","player_rush_longest",
     ],
     "americanfootball_ncaaf": [
         "h2h","spreads","totals",
-        "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
-        "player_rush_yds","player_rush_attempts","player_rush_tds",
-        "player_reception_yds","player_receptions","player_reception_tds",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_reception_tds",
         "player_reception_longest","player_rush_longest",
     ],
     "baseball_mlb": [
         "h2h","spreads","totals",
         "batter_total_bases","batter_hits","batter_runs_scored","batter_rbis","batter_home_runs","batter_walks",
         "batter_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
-        "player_pass_yds","player_rush_yds","player_receiving_yds","player_receptions"  # for NFL/CFB completeness
     ],
     "icehockey_nhl": [
         "h2h","spreads","totals",
