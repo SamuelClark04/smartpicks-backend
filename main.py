@@ -402,6 +402,22 @@ async def root():
 # ------------------------------------------------------------
 # Helpers & mappings
 # ------------------------------------------------------------
+#
+# ---- request helpers for markets ----
+TEAM_SET = {"h2h", "spreads", "totals"}
+
+def _all_markets_for_sport(sport_key: str) -> str:
+    allowed = SPORT_MARKETS.get(sport_key)
+    if not allowed:
+        return ",".join(sorted(TEAM_SET))
+    return ",".join(sorted(set(allowed).union(TEAM_SET)))
+
+def _split_team_player(csv: str) -> tuple[list[str], list[str]]:
+    items = [m.strip() for m in (csv or "").split(",") if m.strip()]
+    team = [m for m in items if m in TEAM_SET]
+    props = [m for m in items if m not in TEAM_SET]
+    return team, props
+
 # ---- Generic JSON fetch with caching (per-URL) ----
 def _year_from_iso(ts: str) -> Optional[int]:
     # '2025-09-04T00:30:00Z' -> 2025
@@ -1370,6 +1386,191 @@ def map_league_or_sport(league: Optional[str], sport: Optional[str]) -> str:
 # ------------------------------------------------------------
 # Upstream fetch & normalization
 # ------------------------------------------------------------
+#
+# ------------------------------------------------------------
+# HTTP Endpoints
+# ------------------------------------------------------------
+
+from fastapi import Depends
+
+@app.get("/api/odds")
+@app.get("/odds")
+async def api_odds(
+    response: Response,
+    league: Optional[str] = Query(default=None),
+    sport: Optional[str] = Query(default=None),
+    market: Optional[str] = Query(default=None),
+    date: Optional[str] = Query(default=None),
+    bookmakers: Optional[str] = Query(default=None),
+    allow_props: Optional[bool] = Query(default=None),
+    max_prop_events: Optional[int] = Query(default=None),
+):
+    """Return normalized odds. Works in 2 modes:
+    - Free/model mode (ODDS_DISABLE or FREE_SANDBOX or missing key): ESPN events + sandbox team markets + model props per sport.
+    - OddsAPI mode: Team markets via /odds and optional per-event props via /events/{id}/odds (guarded by ODDS_MAX_PROP_EVENTS).
+    """
+    sport_key = map_league_or_sport(league, sport)
+    # Expand 'all' appropriately. In free mode we always include all sport markets to populate UI.
+    if (market or "").lower() == "all":
+        markets_csv = _all_markets_for_sport(sport_key)
+    else:
+        markets_csv = normalize_market_param(market)
+    team_markets, player_markets = _split_team_player(markets_csv)
+
+    # pick books list if provided
+    books = [b.strip() for b in (bookmakers.split(",") if bookmakers else []) if b.strip()] or None
+
+    # Decide mode
+    free_mode = (ODDS_DISABLE or FREE_SANDBOX or not ODDS_API_KEY)
+
+    if free_mode:
+        # 1) events
+        events = _espn_upcoming_events(sport_key) or _sandbox_events_for_sport(sport_key)
+        # 2) attach team markets
+        for ev in events:
+            team = _sandbox_team_markets(ev)
+            ev.bookmakers.append(APIBookmaker(key="sandbox", title="Sandbox", last_update="", markets=team))
+        # 3) attach model props if requested
+        if player_markets:
+            for ev in events:
+                mkts = _model_props_for_event(ev, sport_key, player_markets) or []
+                if mkts:
+                    # merge into first bookmaker (sandbox) to keep payload compact
+                    if ev.bookmakers:
+                        ev.bookmakers[0] = APIBookmaker(
+                            key=ev.bookmakers[0].key,
+                            title=ev.bookmakers[0].title,
+                            last_update=ev.bookmakers[0].last_update,
+                            markets=_merge_market_lists(ev.bookmakers[0].markets, mkts),
+                        )
+                    else:
+                        ev.bookmakers.append(APIBookmaker(key="model_free", title="Model (Free)", last_update="", markets=mkts))
+        # 4) optional date filter
+        events = filter_by_date(events, date)
+        # headers for debugging
+        response.headers["x-mode"] = "free"
+        response.headers["x-source-events"] = "espn" if events else "sandbox"
+        return events
+
+    # ---- OddsAPI mode ----
+    allow_props_eff = ODDS_PULL_PLAYER_ON_ODDS if allow_props is None else bool(allow_props)
+    max_props_eff = ODDS_MAX_PROP_EVENTS if (max_prop_events is None) else int(max_prop_events)
+
+    async with httpx.AsyncClient() as http:
+        evs, hdrs = await fetch_odds_events(
+            http=http,
+            sport_key=sport_key,
+            markets_csv=",".join(sorted(set(team_markets + player_markets))) or TEAM_MARKETS,
+            bookmakers=books,
+            allow_props=allow_props_eff,
+            max_prop_events=max_props_eff,
+        )
+    response.headers["x-requests-remaining"] = hdrs.get("x-requests-remaining", "")
+    response.headers["x-mode"] = "oddsapi"
+    return filter_by_date(evs, date)
+
+
+@app.get("/api/upcoming")
+@app.get("/upcoming")
+async def api_upcoming(
+    response: Response,
+    league: Optional[str] = Query(default=None),
+    sport: Optional[str] = Query(default=None),
+    market: Optional[str] = Query(default=None),
+    date: Optional[str] = Query(default=None),
+):
+    # Alias to /api/odds (your app calls both)
+    return await api_odds(response=response, league=league, sport=sport, market=market, date=date)
+
+
+@app.get("/api/props")
+async def api_props(
+    response: Response,
+    event_id: str = Query(...),
+    league: Optional[str] = Query(default=None),
+    sport: Optional[str] = Query(default=None),
+    market: Optional[str] = Query(default=None),
+):
+    sport_key = map_league_or_sport(league, sport)
+    # Determine which markets we want for this event (props only by default)
+    markets_csv = _all_markets_for_sport(sport_key) if (market or "").lower() == "all" else (market or "")
+    _, player_markets = _split_team_player(markets_csv)
+    if not player_markets:
+        player_markets = list(set(SPORT_MARKETS.get(sport_key, [])) - TEAM_SET)
+
+    free_mode = (ODDS_DISABLE or FREE_SANDBOX or not ODDS_API_KEY)
+    if free_mode:
+        # Build a synthetic event shell and return model props
+        ev = APIEvent(id=str(event_id), sport_key=sport_key, sport_title=HUMAN_TITLES.get(sport_key, sport_key),
+                      commence_time="", home_team="Home", away_team="Away", bookmakers=[])
+        return _model_props_for_event(ev, sport_key, player_markets) or _sandbox_player_markets_for_sport(ev, sport_key, player_markets)
+
+    # OddsAPI per-event fetch for props
+    async with httpx.AsyncClient() as http:
+        # Reuse helper inside fetch_odds_events for per-event; replicate minimal logic here
+        per_event_url_tpl = f"{ODDS_API_BASE}/sports/{sport_key}/events/{{eid}}/odds"
+        mkts: list[APIMarket] = []
+        for chunk in _split_markets(",".join(player_markets), 3):
+            params = {
+                "apiKey": ODDS_API_KEY,
+                "regions": ODDS_REGIONS,
+                "oddsFormat": "american",
+                "bookmakers": ",".join(DEFAULT_BOOKMAKERS),
+                "markets": chunk,
+            }
+            r = await http.get(per_event_url_tpl.format(eid=urllib.parse.quote(str(event_id))), params=params, timeout=30)
+            if r.status_code != 200:
+                continue
+            raw = r.json()
+            raw_event = raw[0] if isinstance(raw, list) and raw else raw
+            for b in (raw_event.get("bookmakers") or []):
+                for m in (b.get("markets") or []):
+                    outs = []
+                    for o in (m.get("outcomes") or []):
+                        _name = str(o.get("name", "")).strip()
+                        _desc = o.get("description") or o.get("player") or o.get("playerName") or ""
+                        try:
+                            _price = float(o.get("price", 0) or 0)
+                        except Exception:
+                            _price = 0.0
+                        outs.append(APIOutcome(name=_name, price=_price, point=o.get("point"), description=_desc))
+                    mkts.append(APIMarket(key=str(m.get("key", "")), outcomes=outs))
+        return mkts
+
+
+@app.get("/api/signals")
+async def api_signals(
+    response: Response,
+    event_id: str = Query(...),
+    league: Optional[str] = Query(default=None),
+    sport: Optional[str] = Query(default=None),
+):
+    sport_key = map_league_or_sport(league, sport)
+    # Try to get the event from cache; otherwise synthesize a minimal one
+    cached = _odds_cache_get(sport_key, "upcoming", _all_markets_for_sport(sport_key), ODDS_REGIONS, ",".join(DEFAULT_BOOKMAKERS))
+    ev: Optional[APIEvent] = None
+    if cached:
+        for e in cached:
+            try:
+                if str(e.get("id")) == str(event_id):
+                    ev = APIEvent(**e)
+                    break
+            except Exception:
+                continue
+    if ev is None:
+        ev = APIEvent(id=str(event_id), sport_key=sport_key, sport_title=HUMAN_TITLES.get(sport_key, sport_key),
+                      commence_time="", home_team="Home", away_team="Away", bookmakers=[])
+    # Build signals from adapters (currently NBA implemented, NFL stub)
+    sigs: List[CorrelationSignal] = []
+    try:
+        sigs.extend(adapter_nba_h2h(ev))
+    except Exception:
+        pass
+    try:
+        sigs.extend(adapter_nfl_recent_form(ev))
+    except Exception:
+        pass
+    return sigs
 async def fetch_odds_events(
     http: httpx.AsyncClient,
     sport_key: str,
