@@ -404,20 +404,72 @@ def _http_get_json(url: str, params: Optional[Dict[str, str]] = None, headers: O
     """
     Small helper that caches JSON GET responses using the global TTL cache.
     Keyed by URL + sorted params.
+    Tolerates ESPN endpoints that return JSON with content-type=text/plain.
     """
-    key = _ckey("httpjson", url, json.dumps(params or {}, sort_keys=True))
+    key = _ckey("httpjson", url, json.dumps(params or {}, sort_keys=True), json.dumps(headers or {}, sort_keys=True))
     cached = cache.get(key)
     if cached is not None:
         return cached
+
     import anyio
+
     async def _fetch():
         async with httpx.AsyncClient() as http:
             r = await http.get(url, params=params, headers=headers, timeout=30)
             r.raise_for_status()
-            return r.json()
+            ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+            # Try r.json first; if it fails or content-type is text/plain, fall back to json.loads(r.text)
+            try:
+                if ctype in ("application/json", "application/hal+json", "text/json"):
+                    return r.json()
+                # ESPN often returns text/plain with JSON body
+                return json.loads(r.text)
+            except Exception:
+                # Last resort: try bytes decode
+                try:
+                    return json.loads(r.content.decode("utf-8", errors="ignore"))
+                except Exception:
+                    raise
+
     data = anyio.run(_fetch)
     cache.set(key, data)
     return data
+# Optional public stat APIs (used for real H2H signals)
+BALLDONTLIE_API_BASE = "https://www.balldontlie.io/api/v1"
+BALLDONTLIE_API_KEY = os.getenv("BALLDONTLIE_API_KEY", "").strip()  # optional
+
+MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
+
+NHL_API_BASE = "https://statsapi.web.nhl.com/api/v1"
+# A big union so your Props browser & heatmap can discover a lot out of one call
+CFBD_API_BASE = "https://api.collegefootballdata.com"
+SPORTSDATA_NFL_BASE = "https://api.sportsdata.io/v3/nfl/stats/json"
+SPORTSDATA_NFL_KEY = os.getenv("SPORTSDATA_NFL_KEY", "").strip()
+ALL_MARKETS = ",".join([
+    "h2h","spreads","totals",
+    # NBA
+    "player_points","player_rebounds","player_assists","player_threes","player_steals","player_blocks","player_turnovers",
+    "player_points_rebounds_assists","player_points_rebounds","player_points_assists","player_rebounds_assists",
+    # NFL/CFB
+    "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+    "player_rush_yds","player_rush_attempts","player_rush_tds","player_reception_yds","player_receptions",
+    "player_reception_tds","player_reception_longest","player_rush_longest",
+    # MLB
+    "batter_hits","batter_runs_scored","batter_rbis","batter_home_runs","batter_total_bases","batter_walks",
+    "batter_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
+    # NHL
+    "player_shots_on_goal","player_goals","player_points","player_total_saves"
+])
+
+# --- ESPN endpoints & mapping helper ---
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
+ESPN_SCOREBOARD = {
+    "basketball_nba": f"{ESPN_BASE}/basketball/nba/scoreboard",
+    "americanfootball_nfl": f"{ESPN_BASE}/football/nfl/scoreboard",
+    "americanfootball_ncaaf": f"{ESPN_BASE}/football/college-football/scoreboard",
+    "baseball_mlb": f"{ESPN_BASE}/baseball/mlb/scoreboard",
+    "icehockey_nhl": f"{ESPN_BASE}/hockey/nhl/scoreboard",
+}
     # ----- MLB (statsapi.mlb.com) helpers -----
 def _mlb_teams() -> Dict[str, dict]:
     data = _http_get_json(f"{MLB_API_BASE}/teams", params={"sportId": "1"})
@@ -1734,7 +1786,60 @@ def build_signals_for_event(ev: APIEvent) -> List[CorrelationSignal]:
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.0"}
+    return {"ok": True, "version": "1.0.2"}
+# Diagnostics endpoint for iOS app to check free-data provider status
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    """Return quick-readiness info for free sources (no odds credits required)."""
+    verdict = {"espn": {}, "balldontlie": None, "mlb": None, "nhl": None}
+
+    # ESPN scoreboards
+    for skey, url in ESPN_SCOREBOARD.items():
+        try:
+            data = _http_get_json(url)
+            evs = 0
+            # ESPN scoreboard has different shapes per sport; try common paths
+            if isinstance(data, dict):
+                if isinstance(data.get("events"), list):
+                    evs = len(data["events"]) 
+                elif isinstance(data.get("leagues"), list):
+                    # some responses nest events under day/events; handle generously
+                    evs = len(data.get("events", []))
+            verdict["espn"][skey] = {"ok": True, "events": evs}
+        except Exception as e:
+            verdict["espn"][skey] = {"ok": False, "error": str(e)[:120]}
+
+    # balldontlie quick ping (teams)
+    try:
+        tdata = _http_get_json(f"{BALLDONTLIE_API_BASE}/teams")
+        verdict["balldontlie"] = {"ok": True, "teams": len(tdata.get("data", []))}
+    except Exception as e:
+        verdict["balldontlie"] = {"ok": False, "error": str(e)[:120]}
+
+    # MLB/NHL stat APIs quick pings
+    try:
+        m = _http_get_json(f"{MLB_API_BASE}/teams", params={"sportId": "1"})
+        verdict["mlb"] = {"ok": True, "teams": len(m.get("teams", []))}
+    except Exception as e:
+        verdict["mlb"] = {"ok": False, "error": str(e)[:120]}
+
+    try:
+        n = _http_get_json(f"{NHL_API_BASE}/teams")
+        verdict["nhl"] = {"ok": True, "teams": len(n.get("teams", []))}
+    except Exception as e:
+        verdict["nhl"] = {"ok": False, "error": str(e)[:120]}
+
+    return verdict
+
+# Ingestion ping endpoint for Settings page (shows provider counts/URLs)
+@app.get("/api/ingest/ping")
+def api_ingest_ping():
+    return {
+        "balldontlie": _http_get_json(f"{BALLDONTLIE_API_BASE}/teams").get("meta", {"ok": True}) if isinstance(_http_get_json(f"{BALLDONTLIE_API_BASE}/teams"), dict) else {"ok": True},
+        "mlb": {"ok": True, "url": f"{MLB_API_BASE}/teams"},
+        "nhl": {"ok": True, "url": f"{NHL_API_BASE}/teams"},
+        "espn_endpoints": list(ESPN_SCOREBOARD.values()),
+    }
 
 # Backend feature toggles/meta endpoint
 @app.get("/api/meta")
