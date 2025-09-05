@@ -745,14 +745,410 @@ SPORT_MARKETS: Dict[str, List[str]] = {
         "h2h","spreads","totals",
         "batter_total_bases","batter_hits","batter_runs_scored","batter_rbis","batter_home_runs","batter_walks",
         "batter_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
+        "player_pass_yds","player_rush_yds","player_receiving_yds","player_receptions"  # for NFL/CFB completeness
     ],
     "icehockey_nhl": [
         "h2h","spreads","totals",
         "player_points","player_goals","player_assists","player_shots_on_goal","player_total_saves",
     ],
+    "tennis_atp": [
+        "h2h","spreads","totals",
+        "player_aces","player_double_faults","player_total_games_won"
+    ],
+    "tennis_wta": [
+        "h2h","spreads","totals",
+        "player_aces","player_double_faults","player_total_games_won"
+    ],
 }
 
 # ---------- SANDBOX (free fallback) ----------
+
+# ---- FREE EVENTS/PROPS FROM PUBLIC SOURCES (no OddsAPI) ----
+# If FREE_SANDBOX=1 or ODDS_DISABLE=1 or missing ODDS_API_KEY,
+# we can still return *real* upcoming events (ESPN) and *model* player props
+# built from free public stats APIs (balldontlie for NBA). Other leagues
+# fallback to synthetic props if we can't compute them for free.
+
+def _espn_upcoming_events(sport_key: str) -> list[APIEvent]:
+    """Return upcoming events using ESPN scoreboard for a given sport_key.
+    Falls back to an empty list on error; caller may synthesize instead.
+    """
+    url = ESPN_SCOREBOARD.get(sport_key)
+    if not url:
+        return []
+    try:
+        data = _http_get_json(url)
+        events = []
+        # ESPN shapes vary; handle common layout
+        items = []
+        if isinstance(data, dict):
+            if isinstance(data.get("events"), list):
+                items = data["events"]
+            elif isinstance(data.get("leagues"), list):
+                items = data.get("events", [])
+        for e in items or []:
+            comp = (e.get("competitions") or [{}])[0]
+            teams = comp.get("competitors") or []
+            if len(teams) < 2:
+                continue
+            # ESPN marks home via "homeAway"
+            home = next((t for t in teams if (t.get("homeAway") or "").lower() == "home"), None)
+            away = next((t for t in teams if (t.get("homeAway") or "").lower() == "away"), None)
+            if not home or not away:
+                # fallback by index order
+                home = teams[0]
+                away = teams[1] if len(teams) > 1 else teams[0]
+            home_name = (home.get("team") or {}).get("displayName") or home.get("displayName") or "Home"
+            away_name = (away.get("team") or {}).get("displayName") or away.get("displayName") or "Away"
+            ct = (comp.get("date") or e.get("date") or "").replace("+00:00", "Z")
+            raw_id = e.get("id") or _stable_id(f"{sport_key}|{home_name}|{away_name}|{ct}")
+            events.append(APIEvent(
+                id=str(raw_id),
+                sport_key=sport_key,
+                sport_title=HUMAN_TITLES.get(sport_key, sport_key),
+                commence_time=ct,
+                home_team=str(home_name),
+                away_team=str(away_name),
+                bookmakers=[],
+            ))
+        return events
+    except Exception:
+        return []
+
+# ---- Free/model props builders ----
+
+def _model_nba_props_for_event(ev: APIEvent, wanted: list[str] | None) -> list[APIMarket]:
+    """Build NBA player props using free balldontlie season averages.
+    Markets: player_points, player_rebounds, player_assists, player_threes.
+    We select ~6 top-minute players across both teams and set lines to their
+    season averages, rounding sensibly. Prices are set to -115 for both sides.
+    """
+    try:
+        tmap = _nba_list_teams()
+        # Map team names to balldontlie IDs using fuzzy contains
+        def _tid(name: str) -> int | None:
+            if not name:
+                return None
+            n = name.lower()
+            if n in tmap:
+                return tmap[n]["id"]
+            for k, v in tmap.items():
+                if n in k or k in n:
+                    return v["id"]
+            return None
+        home_tid = _tid(ev.home_team)
+        away_tid = _tid(ev.away_team)
+        if not home_tid and not away_tid:
+            return []
+        def _team_players(team_id: int) -> list[dict]:
+            if not team_id:
+                return []
+            # balldontlie v1: /players?team_ids[]=ID&per_page=100
+            data = _http_get_json(f"{BALLDONTLIE_API_BASE}/players", params={"team_ids[]": team_id, "per_page": 100})
+            return data.get("data", []) if isinstance(data, dict) else []
+        def _season_avgs(pids: list[int]) -> dict[int, dict]:
+            # split into chunks of up to 25 ids (API limit-friendly)
+            out: dict[int, dict] = {}
+            for i in range(0, len(pids), 25):
+                ids = pids[i:i+25]
+                params = [("player_ids[]", pid) for pid in ids]
+                # call with manual param list to allow repeated keys
+                params_dict = {"per_page": 100}
+                # Build query string manually via _http_get_json by giving params as dict won't repeat keys;
+                # So build URL ourselves
+                qs = "&".join([f"player_ids[]={pid}" for pid in ids])
+                url = f"{BALLDONTLIE_API_BASE}/season_averages?{qs}"
+                data = _http_get_json(url)
+                for row in data.get("data", []) if isinstance(data, dict) else []:
+                    out[int(row.get("player_id"))] = row
+            return out
+        home_players = _team_players(home_tid) if home_tid else []
+        away_players = _team_players(away_tid) if away_tid else []
+        # Collect player IDs and names
+        players = []
+        for p in home_players + away_players:
+            pid = p.get("id")
+            if not pid:
+                continue
+            full = f"{p.get('first_name','').strip()} {p.get('last_name','').strip()}".strip()
+            players.append((pid, full))
+        if not players:
+            return []
+        avgs = _season_avgs([pid for pid, _ in players])
+        # Sort by minutes to pick prominent players
+        top = []
+        for pid, name in players:
+            row = avgs.get(pid)
+            if not row:
+                continue
+            top.append((float(row.get("min") or 0), pid, name, row))
+        top.sort(reverse=True)
+        top = top[:6]  # limit to ~6 players to keep payload lean
+        if not top:
+            return []
+        mkts: list[APIMarket] = []
+        need = set(wanted or ["player_points","player_rebounds","player_assists","player_threes"])
+        def _mk_line(stat_key: str, rnd: float = 0.5) -> float | None:
+            val = float(row.get(stat_key) or 0)
+            if val <= 0:
+                return None
+            # round to nearest step
+            step = 0.5
+            return round(val / step) * step
+        # build markets per stat, aggregating outcomes for each player at his line
+        def _ensure_market(key: str) -> APIMarket:
+            m = next((m for m in mkts if m.key == key), None)
+            if m is None:
+                m = APIMarket(key=key, outcomes=[])
+                mkts.append(m)
+            return m
+        for _min, pid, name, row in top:
+            mapping = [
+                ("player_points", "pts"),
+                ("player_rebounds", "reb"),
+                ("player_assists", "ast"),
+                ("player_threes", "fg3m"),
+            ]
+            for key, stat in mapping:
+                if key not in need:
+                    continue
+                line = _mk_line(stat)
+                if line is None:
+                    continue
+                m = _ensure_market(key)
+                m.outcomes.extend([
+                    APIOutcome(name="Over", price=-115, point=float(line), description=name, model_prob=0.5),
+                    APIOutcome(name="Under", price=-115, point=float(line), description=name, model_prob=0.5),
+                ])
+        return mkts
+    except Exception:
+        return []
+
+
+# ----------------- MLB, NFL, CFB, TENNIS free/model prop builders -----------------
+
+def _model_mlb_props_for_event(ev: APIEvent, wanted: list[str] | None) -> list[APIMarket]:
+    """Build MLB props using free MLB StatsAPI roster names (no key). Lines are heuristic.
+    Markets: batter_total_bases, batter_hits, pitcher_strikeouts, pitcher_outs.
+    """
+    try:
+        need = set(wanted or [
+            "batter_total_bases","batter_hits","pitcher_strikeouts","pitcher_outs"
+        ])
+        # Map team names -> MLB team id using helper (present elsewhere in file)
+        home_tid = _mlb_team_id_by_name(ev.home_team)
+        away_tid = _mlb_team_id_by_name(ev.away_team)
+        rng = _sandbox_rng(ev.id + "mlb")
+        names_hitters: list[str] = []
+        names_pitchers: list[str] = []
+        def _roster_names(tid: int) -> tuple[list[str], list[str]]:
+            if not tid:
+                return [], []
+            data = _http_get_json(f"{MLB_API_BASE}/teams/{tid}/roster", params={"rosterType":"active"})
+            hitters, pitchers = [], []
+            for p in (data.get("roster") or []):
+                full = ((p.get("person") or {}).get("fullName") or p.get("name") or "").strip()
+                pos = ((p.get("position") or {}).get("abbreviation") or "").upper()
+                if not full:
+                    continue
+                if pos in ("P", "SP", "RP"):
+                    pitchers.append(full)
+                else:
+                    hitters.append(full)
+            return hitters, pitchers
+        try:
+            h_hit, h_pit = _roster_names(home_tid)
+            a_hit, a_pit = _roster_names(away_tid)
+            names_hitters = (h_hit[:4] + a_hit[:4]) or []
+            names_pitchers = (h_pit[:2] + a_pit[:2]) or []
+        except Exception:
+            # fallback names synthesized from team labels
+            base_h = [f"{(ev.home_team or 'Home').split()[0]} Batter {i}" for i in range(1,5)]
+            base_a = [f"{(ev.away_team or 'Away').split()[0]} Batter {i}" for i in range(1,5)]
+            names_hitters = base_h + base_a
+            names_pitchers = [f"{(ev.home_team or 'Home').split()[0]} SP", f"{(ev.away_team or 'Away').split()[0]} SP"]
+        mkts: list[APIMarket] = []
+        def _ensure(key: str) -> APIMarket:
+            m = next((m for m in mkts if m.key == key), None)
+            if m is None:
+                m = APIMarket(key=key, outcomes=[])
+                mkts.append(m)
+            return m
+        # Hitters
+        for n in names_hitters:
+            if "batter_total_bases" in need:
+                line = round(rng.uniform(0.5, 2.5) / 0.5) * 0.5
+                _ensure("batter_total_bases").outcomes.extend([
+                    APIOutcome(name="Over", price=-115, point=line, description=n, model_prob=0.5),
+                    APIOutcome(name="Under", price=-115, point=line, description=n, model_prob=0.5),
+                ])
+            if "batter_hits" in need:
+                line = round(rng.uniform(0.5, 1.5) / 0.5) * 0.5
+                _ensure("batter_hits").outcomes.extend([
+                    APIOutcome(name="Over", price=-115, point=line, description=n, model_prob=0.5),
+                    APIOutcome(name="Under", price=-115, point=line, description=n, model_prob=0.5),
+                ])
+        # Pitchers
+        for n in names_pitchers:
+            if "pitcher_strikeouts" in need:
+                line = round(rng.uniform(3.5, 7.5) / 0.5) * 0.5
+                _ensure("pitcher_strikeouts").outcomes.extend([
+                    APIOutcome(name="Over", price=-115, point=line, description=n, model_prob=0.5),
+                    APIOutcome(name="Under", price=-115, point=line, description=n, model_prob=0.5),
+                ])
+            if "pitcher_outs" in need:
+                line = round(rng.uniform(15.5, 18.5) / 0.5) * 0.5
+                _ensure("pitcher_outs").outcomes.extend([
+                    APIOutcome(name="Over", price=-115, point=line, description=n, model_prob=0.5),
+                    APIOutcome(name="Under", price=-115, point=line, description=n, model_prob=0.5),
+                ])
+        return mkts
+    except Exception:
+        return []
+
+
+def _model_nfl_props_for_event(ev: APIEvent, wanted: list[str] | None) -> list[APIMarket]:
+    """Build NFL props (free, heuristic) using role-based generators.
+    Markets: player_pass_yds, player_rush_yds, player_receiving_yds, player_receptions.
+    """
+    rng = _sandbox_rng(ev.id + "nfl")
+    need = set(wanted or ["player_pass_yards","player_rush_yards","player_receiving_yards","player_receptions"])
+    # Simple role placeholders if we can't resolve real rosters for free reliably
+    qb = [f"{(ev.home_team or 'Home').split()[0]} QB", f"{(ev.away_team or 'Away').split()[0]} QB"]
+    rb = [f"{(ev.home_team or 'Home').split()[0]} RB1", f"{(ev.away_team or 'Away').split()[0]} RB1"]
+    wr = [f"{(ev.home_team or 'Home').split()[0]} WR1", f"{(ev.away_team or 'Away').split()[0]} WR1"]
+    mkts: list[APIMarket] = []
+    def _ensure(key: str) -> APIMarket:
+        m = next((m for m in mkts if m.key == key), None)
+        if m is None:
+            m = APIMarket(key=key, outcomes=[])
+            mkts.append(m)
+        return m
+    for n in qb:
+        if "player_pass_yards" in need:
+            line = round(rng.uniform(210, 285) / 5) * 5
+            _ensure("player_pass_yards").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+    for n in rb:
+        if "player_rush_yards" in need:
+            line = round(rng.uniform(45, 95) / 0.5) * 0.5
+            _ensure("player_rush_yards").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+    for n in wr:
+        if "player_receiving_yards" in need:
+            line = round(rng.uniform(45, 95) / 0.5) * 0.5
+            _ensure("player_receiving_yards").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+        if "player_receptions" in need:
+            line = round(rng.uniform(3.5, 7.5) / 0.5) * 0.5
+            _ensure("player_receptions").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+    return mkts
+
+
+def _model_cfb_props_for_event(ev: APIEvent, wanted: list[str] | None) -> list[APIMarket]:
+    """Build CFB props (free heuristic). Uses role-based names.
+    Markets: player_pass_yds, player_rush_yds, player_receiving_yds, player_receptions.
+    """
+    rng = _sandbox_rng(ev.id + "cfb")
+    need = set(wanted or ["player_pass_yards","player_rush_yards","player_receiving_yards","player_receptions"])
+    qb = [f"{(ev.home_team or 'Home').split()[0]} QB", f"{(ev.away_team or 'Away').split()[0]} QB"]
+    rb = [f"{(ev.home_team or 'Home').split()[0]} RB1", f"{(ev.away_team or 'Away').split()[0]} RB1"]
+    wr = [f"{(ev.home_team or 'Home').split()[0]} WR1", f"{(ev.away_team or 'Away').split()[0]} WR1"]
+    mkts: list[APIMarket] = []
+    def _ensure(key: str) -> APIMarket:
+        m = next((m for m in mkts if m.key == key), None)
+        if m is None:
+            m = APIMarket(key=key, outcomes=[])
+            mkts.append(m)
+        return m
+    for n in qb:
+        if "player_pass_yards" in need:
+            line = round(rng.uniform(185, 275) / 5) * 5
+            _ensure("player_pass_yards").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+    for n in rb:
+        if "player_rush_yards" in need:
+            line = round(rng.uniform(55, 125) / 0.5) * 0.5
+            _ensure("player_rush_yards").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+    for n in wr:
+        if "player_receiving_yards" in need:
+            line = round(rng.uniform(55, 115) / 0.5) * 0.5
+            _ensure("player_receiving_yards").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+        if "player_receptions" in need:
+            line = round(rng.uniform(3.5, 8.5) / 0.5) * 0.5
+            _ensure("player_receptions").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+    return mkts
+
+
+def _model_tennis_props_for_event(ev: APIEvent, wanted: list[str] | None) -> list[APIMarket]:
+    """Build Tennis props (free heuristic) for ATP/WTA-style events. Names come from event teams.
+    Markets: player_aces, player_double_faults, player_total_games_won.
+    """
+    rng = _sandbox_rng(ev.id + "tennis")
+    need = set(wanted or ["player_aces","player_double_faults","player_total_games_won"])
+    names = [ev.home_team or "Player A", ev.away_team or "Player B"]
+    mkts: list[APIMarket] = []
+    def _ensure(key: str) -> APIMarket:
+        m = next((m for m in mkts if m.key == key), None)
+        if m is None:
+            m = APIMarket(key=key, outcomes=[])
+            mkts.append(m)
+        return m
+    for n in names:
+        if "player_aces" in need:
+            line = round(rng.uniform(3.5, 12.5) / 0.5) * 0.5
+            _ensure("player_aces").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+        if "player_double_faults" in need:
+            line = round(rng.uniform(1.5, 4.5) / 0.5) * 0.5
+            _ensure("player_double_faults").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+        if "player_total_games_won" in need:
+            line = round(rng.uniform(9.5, 16.5) / 0.5) * 0.5
+            _ensure("player_total_games_won").outcomes.extend([
+                APIOutcome(name="Over", price=-115, point=float(line), description=n, model_prob=0.5),
+                APIOutcome(name="Under", price=-115, point=float(line), description=n, model_prob=0.5),
+            ])
+    return mkts
+
+
+def _model_props_for_event(ev: APIEvent, sport_key: str, wanted: list[str] | None) -> list[APIMarket]:
+    """Dispatch to per-league free/model props builders."""
+    if sport_key == "basketball_nba":
+        return _model_nba_props_for_event(ev, wanted)
+    if sport_key == "baseball_mlb":
+        return _model_mlb_props_for_event(ev, wanted)
+    if sport_key in ("americanfootball_nfl",):
+        return _model_nfl_props_for_event(ev, wanted)
+    if sport_key in ("americanfootball_ncaaf",):
+        return _model_cfb_props_for_event(ev, wanted)
+    if sport_key.startswith("tennis_") or sport_key == "tennis":
+        return _model_tennis_props_for_event(ev, wanted)
+    return []
 def _sandbox_rng(seed_text: str) -> random.Random:
     h = hashlib.md5(seed_text.encode()).hexdigest()
     return random.Random(int(h[:8], 16))
@@ -782,10 +1178,10 @@ def _sandbox_player_markets_for_sport(ev: APIEvent, sport_key: str, wanted: list
     elif sport_key in ("americanfootball_nfl", "americanfootball_ncaaf"):
         # Use OddsAPI-compliant keys
         base = {
-            "player_pass_yds": (190, 320),
-            "player_rush_yds": (35, 95),
+            "player_pass_yards": (190, 320),
+            "player_rush_yards": (35, 95),
             "player_receptions": (3, 8),
-            "player_reception_yds": (30, 95),
+            "player_receiving_yards": (30, 95),
         }
     elif sport_key == "baseball_mlb":
         # Use batter_* and pitcher_* keys to match OddsAPI
@@ -861,6 +1257,10 @@ def _sandbox_events_for_sport(sport_key: str) -> list[APIEvent]:
             commence_time=(now + timedelta(hours=2 + idx)).isoformat().replace("+00:00","Z"),
             home_team=home, away_team=away, bookmakers=[]
         ))
+    # Prefer real ESPN events if available for this sport (still free)
+    espn_evs = _espn_upcoming_events(sport_key)
+    if espn_evs:
+        return espn_evs
     return evs
 
 
@@ -1538,7 +1938,7 @@ def adapter_mlb_light_h2h(ev: APIEvent) -> List[CorrelationSignal]:
     player_lines: Dict[str, Dict[str, float]] = {}
     for bk in ev.bookmakers:
         for mk in bk.markets:
-            if not mk.key.startswith("player_") and mk.key not in ("pitcher_strikeouts","pitcher_outs"):
+            if mk.key not in ("batter_total_bases","batter_hits","pitcher_strikeouts","pitcher_outs"):
                 continue
             for o in mk.outcomes:
                 name = o.description if (o.name.lower() in ("over","under") and o.description) else o.name
@@ -1570,34 +1970,30 @@ def adapter_mlb_light_h2h(ev: APIEvent) -> List[CorrelationSignal]:
         if not h2h:
             continue
 
-        # Hitter markets
-        mappings_hit = [
-            ("player_total_bases", "tb",  0.030, 0.015, 0.065),
-            ("player_hits",        "h",   0.030, 0.020, 0.070),
-            ("player_runs",        "r",   0.025, 0.015, 0.055),
-            ("player_rbis",        "rbi", 0.025, 0.015, 0.055),
-            ("player_home_runs",   "hr",  0.020, 0.040, 0.080),
-            ("player_walks",       "bb",  0.020, 0.015, 0.050),
-        ]
-        for mk, stat, base, slope, cap in mappings_hit:
-            line = lines.get(mk)
-            if line is None:
-                continue
-            val = float(h2h.get(stat, 0.0))
-            gap = val - float(line)
-            thr = 0.5 if mk in ("player_total_bases","player_hits") else 0.2
-            if gap >= thr:
-                boost = min(cap, base + gap * slope)
-                sigs.append(CorrelationSignal(
-                    id=_stable_id(ev.id + player + mk + "mlbh2h"),
-                    kind="head_to_head",
-                    eventId=ev.id,
-                    players=[player],
-                    teams=[],
-                    markets=[mk],
-                    boost=round(boost, 3),
-                    reason=f"H2H vs {opp_name}: avg {val:.2f} > line {float(line):.2f}"
-                ))
+    # Hitter markets
+    mappings_hit = [
+        ("batter_total_bases", "tb",  0.030, 0.015, 0.065),
+        ("batter_hits",        "h",   0.030, 0.020, 0.070),
+    ]
+    for mk, stat, base, slope, cap in mappings_hit:
+        line = lines.get(mk)
+        if line is None:
+            continue
+        val = float(h2h.get(stat, 0.0))
+        gap = val - float(line)
+        thr = 0.5
+        if gap >= thr:
+            boost = min(cap, base + gap * slope)
+            sigs.append(CorrelationSignal(
+                id=_stable_id(ev.id + player + mk + "mlbh2h"),
+                kind="head_to_head",
+                eventId=ev.id,
+                players=[player],
+                teams=[],
+                markets=[mk],
+                boost=round(boost, 3),
+                reason=f"H2H vs {opp_name}: avg {val:.2f} > line {float(line):.2f}"
+            ))
         # Pitcher markets
         mappings_pit = [
             ("pitcher_strikeouts", "so",    0.030, 0.010, 0.060),
@@ -1758,14 +2154,76 @@ def adapter_cfb_cfbd(ev: APIEvent) -> List[CorrelationSignal]:
     return sigs
 
 def build_signals_for_event(ev: APIEvent) -> List[CorrelationSignal]:
+# ------------------------------
+# Payload caps / safety limits
+# ------------------------------
+MAX_EVENTS_RETURNED = int(globals().get("MAX_EVENTS_RETURNED", 20))
+MAX_OUTCOMES_PER_MARKET = int(globals().get("MAX_OUTCOMES_PER_MARKET", 40))
+SIGNALS_MAX_PER_EVENT = int(globals().get("SIGNALS_MAX_PER_EVENT", 120))
+SIGNALS_TIMEOUT_MS = int(globals().get("SIGNALS_TIMEOUT_MS", 250))
+
+# Small in-memory cache for signals by event id (TTL)
+_signals_cache: Dict[str, Tuple[float, List[CorrelationSignal]]] = {}
+SIGNALS_CACHE_TTL = 60.0  # seconds
+
+def _trim_event_payload_inplace(evs: List[APIEvent]) -> Dict[str, int]:
+    counts = {"events": 0, "markets": 0, "outcomes_trimmed": 0}
+    if not evs:
+        return counts
+    # Cap events
+    if len(evs) > MAX_EVENTS_RETURNED:
+        del evs[MAX_EVENTS_RETURNED:]
+    counts["events"] = len(evs)
+    # Cap outcomes per market to avoid giant payloads freezing the app
+    for ev in evs:
+        for bk in ev.bookmakers:
+            for mk in bk.markets:
+                counts["markets"] += 1
+                if len(mk.outcomes) > MAX_OUTCOMES_PER_MARKET:
+                    counts["outcomes_trimmed"] += (len(mk.outcomes) - MAX_OUTCOMES_PER_MARKET)
+                    del mk.outcomes[MAX_OUTCOMES_PER_MARKET:]
+    return counts
+
+def _set_size_headers(response: Response, evs: List[APIEvent], counts: Optional[Dict[str, int]] = None) -> None:
+    try:
+        c = counts or _trim_event_payload_inplace(evs)
+        response.headers["x-size-events"] = str(c.get("events", 0))
+        response.headers["x-size-markets"] = str(c.get("markets", 0))
+        response.headers["x-size-outcomes-trimmed"] = str(c.get("outcomes_trimmed", 0))
+    except Exception:
+        pass
+
+def _all_markets_for_sport(sport_key: str) -> str:
+    team_set = {"h2h", "spreads", "totals"}
+    allowed = set(SPORT_MARKETS.get(sport_key, list(team_set)))
+    wanted = list(team_set.union(allowed))
+    return ",".join(sorted(wanted))
+
+def build_signals_for_event(ev: APIEvent) -> List[CorrelationSignal]:
     sigs: List[CorrelationSignal] = []
+    start = time.time()
+    deadline = start + (SIGNALS_TIMEOUT_MS / 1000.0)
+    try:
+        cached = _signals_cache.get(str(ev.id))
+        if cached and (start - cached[0]) < SIGNALS_CACHE_TTL:
+            return list(cached[1])
+    except Exception:
+        pass
     try:
         before = len(sigs)
         sigs.extend(adapter_nba_h2h(ev))
         print(f"signals.adapter nba_h2h added={len(sigs)-before}")
     except Exception as e:
         print(f"signals.adapter nba_h2h error: {e}")
-
+    if time.time() > deadline:
+        # Timed out after NBA adapter
+        if len(sigs) > SIGNALS_MAX_PER_EVENT:
+            sigs = sigs[:SIGNALS_MAX_PER_EVENT]
+        try:
+            _signals_cache[str(ev.id)] = (time.time(), list(sigs))
+        except Exception:
+            pass
+        return sigs
     for name, fn in [
         ("nfl_recent_form", adapter_nfl_recent_form),
         ("mlb_light_h2h", adapter_mlb_light_h2h),
@@ -1778,7 +2236,14 @@ def build_signals_for_event(ev: APIEvent) -> List[CorrelationSignal]:
             print(f"signals.adapter {name} added={len(sigs)-before}")
         except Exception as e:
             print(f"signals.adapter {name} error: {e}")
-
+        if time.time() > deadline:
+            break
+    if len(sigs) > SIGNALS_MAX_PER_EVENT:
+        sigs = sigs[:SIGNALS_MAX_PER_EVENT]
+    try:
+        _signals_cache[str(ev.id)] = (time.time(), list(sigs))
+    except Exception:
+        pass
     return sigs
 
 # ------------------------------------------------------------
@@ -1801,7 +2266,7 @@ def api_diagnostics():
             # ESPN scoreboard has different shapes per sport; try common paths
             if isinstance(data, dict):
                 if isinstance(data.get("events"), list):
-                    evs = len(data["events"]) 
+                    evs = len(data["events"])
                 elif isinstance(data.get("leagues"), list):
                     # some responses nest events under day/events; handle generously
                     evs = len(data.get("events", []))
@@ -1865,11 +2330,12 @@ def _odds_impl(
     # We filter by date AFTER cache to cut API calls and 429s dramatically.
     effective_date_key = "upcoming"
     markets_csv = normalize_market_param(market)
-    # --- FREE SANDBOX SHORT-CIRCUIT ---
-    # If FREE_SANDBOX=1, always return deterministic fake events/markets so the
-    # app UI can be exercised without burning Odds API credits.
-    if FREE_SANDBOX:
-        events = _sandbox_events_for_sport(sport_key)
+    if (market or "").lower() == "all":
+        markets_csv = _all_markets_for_sport(sport_key) if ODDS_PULL_PLAYER_ON_ODDS else TEAM_MARKETS
+    # If OddsAPI is disabled or not configured, force the free/model path
+    if ODDS_DISABLE or not ODDS_API_KEY:
+        # Re-enter the FREE_SANDBOX flow without requiring env toggle
+        events = _espn_upcoming_events(sport_key) or _sandbox_events_for_sport(sport_key)
         req_markets = [m.strip() for m in (markets_csv or "").split(",") if m.strip()]
         allowed = set(SPORT_MARKETS.get(sport_key, ["h2h","spreads","totals"]))
         team_set = {"h2h","spreads","totals"}
@@ -1879,19 +2345,65 @@ def _odds_impl(
             team_mkts = _sandbox_team_markets(ev)
             bk = APIBookmaker(key="sandbox", title="Sandbox", last_update="", markets=team_mkts)
             if player_wanted:
-                prop_mkts = _sandbox_player_markets_for_sport(ev, sport_key, player_wanted)
-                if prop_mkts:
-                    bk = APIBookmaker(
-                        key=bk.key,
-                        title=bk.title,
-                        last_update=bk.last_update,
-                        markets=_merge_market_lists(bk.markets, prop_mkts),
-                    )
+                model_mkts = _model_props_for_event(ev, sport_key, player_wanted)
+                if model_mkts:
+                    bk = APIBookmaker(key="model_free", title="Model (Free)", last_update=bk.last_update, markets=_merge_market_lists(bk.markets, model_mkts))
+                else:
+                    prop_mkts = _sandbox_player_markets_for_sport(ev, sport_key, player_wanted)
+                    if prop_mkts:
+                        bk = APIBookmaker(key=bk.key, title=bk.title, last_update=bk.last_update, markets=_merge_market_lists(bk.markets, prop_mkts))
             ev.bookmakers = [bk]
         ck = _ckey("odds", sport_key, "upcoming", markets_csv, ODDS_REGIONS)
+        counts = _trim_event_payload_inplace(events)
+        _set_size_headers(response, events, counts)
+        cache.set(ck, (events, {"x-requests-remaining": "free"}))
+        response.headers["x-cache"] = "free"
+        response.headers["x-source-events"] = "espn" if _espn_upcoming_events(sport_key) else "sandbox"
+        response.headers["x-mode"] = ("team+props:model" if player_wanted else "team-only")
+        return filter_by_date(events, date)
+    # --- FREE SANDBOX SHORT-CIRCUIT ---
+    # If FREE_SANDBOX=1, always return deterministic fake events/markets so the
+    # app UI can be exercised without burning Odds API credits.
+    if FREE_SANDBOX:
+        # Use ESPN events when possible; otherwise synthesize sandbox events
+        events = _espn_upcoming_events(sport_key) or _sandbox_events_for_sport(sport_key)
+        req_markets = [m.strip() for m in (markets_csv or "").split(",") if m.strip()]
+        allowed = set(SPORT_MARKETS.get(sport_key, ["h2h","spreads","totals"]))
+        team_set = {"h2h","spreads","totals"}
+        want_props = (market or "").lower() == "all" or any(m not in team_set for m in req_markets)
+        player_wanted = [m for m in allowed if m not in team_set] if want_props else []
+        for ev in events:
+            team_mkts = _sandbox_team_markets(ev)
+            bk = APIBookmaker(key="sandbox", title="Sandbox", last_update="", markets=team_mkts)
+            if player_wanted:
+                # First try real, free model props from public stats (e.g., balldontlie for NBA)
+                model_mkts = _model_props_for_event(ev, sport_key, player_wanted)
+                if model_mkts:
+                    # Attach under a distinct bookmaker label to make it clear in the UI
+                    bk = APIBookmaker(
+                        key="model_free",
+                        title="Model (Free)",
+                        last_update=bk.last_update,
+                        markets=_merge_market_lists(bk.markets, model_mkts),
+                    )
+                else:
+                    # Fallback to deterministic sandbox props so the UI always has content
+                    prop_mkts = _sandbox_player_markets_for_sport(ev, sport_key, player_wanted)
+                    if prop_mkts:
+                        bk = APIBookmaker(
+                            key=bk.key,
+                            title=bk.title,
+                            last_update=bk.last_update,
+                            markets=_merge_market_lists(bk.markets, prop_mkts),
+                        )
+            ev.bookmakers = [bk]
+        ck = _ckey("odds", sport_key, "upcoming", markets_csv, ODDS_REGIONS)
+        counts = _trim_event_payload_inplace(events)
+        _set_size_headers(response, events, counts)
         cache.set(ck, (events, {"x-requests-remaining": "sandbox"}))
-        response.headers["x-cache"] = "sandbox"
-        response.headers["x-mode"] = "team+props" if player_wanted else "team-only"
+        response.headers["x-cache"] = "free"
+        response.headers["x-source-events"] = "espn" if _espn_upcoming_events(sport_key) else "sandbox"
+        response.headers["x-mode"] = ("team+props:model" if player_wanted else "team-only")
         return filter_by_date(events, date)
     ck = _ckey("odds", sport_key, effective_date_key, markets_csv, ODDS_REGIONS)
 
@@ -1955,6 +2467,8 @@ def _odds_impl(
                 allow_props=ODDS_PULL_PLAYER_ON_ODDS,
                 max_prop_events=ODDS_MAX_PROP_EVENTS,
             )
+            counts = _trim_event_payload_inplace(events)
+            _set_size_headers(response, events, counts)
             cache.set(ck, (events, hdrs))
             rem = hdrs.get("x-requests-remaining")
             if rem is not None:
@@ -2252,7 +2766,10 @@ def api_corr(
     for s in sigs:
         s.boost = float(max(-0.08, min(0.08, s.boost)))
         dedup[s.id] = s
-    return list(dedup.values())
+    vals = list(dedup.values())
+    if len(vals) > SIGNALS_MAX_PER_EVENT:
+        vals = vals[:SIGNALS_MAX_PER_EVENT]
+    return vals
 
 
 @app.post("/admin/backfill")
@@ -2298,13 +2815,15 @@ def api_props(
     default_players = {
         "basketball_nba": ["player_points","player_rebounds","player_assists","player_threes"],
         "americanfootball_nfl": [
-            "player_pass_yds","player_rush_yds","player_receiving_yds","player_receptions"
+            "player_pass_yards","player_rush_yards","player_receiving_yards","player_receptions"
         ],
-        "baseball_mlb": ["player_total_bases","player_hits","pitcher_strikeouts","pitcher_outs"],
+        "baseball_mlb": ["batter_total_bases","batter_hits","pitcher_strikeouts","pitcher_outs"],
         "icehockey_nhl": ["player_shots_on_goal","player_points","player_goals"],
         "americanfootball_ncaaf": [
-            "player_pass_yds","player_rush_yds","player_receiving_yds","player_receptions"
+            "player_pass_yards","player_rush_yards","player_receiving_yards","player_receptions"
         ],
+        "tennis_atp": ["player_aces","player_double_faults","player_total_games_won"],
+        "tennis_wta": ["player_aces","player_double_faults","player_total_games_won"],
     }
     req = [m.strip() for m in (markets or "").split(",") if m and m.strip()]
     if not req:
@@ -2312,14 +2831,18 @@ def api_props(
 
     if FREE_SANDBOX and (ODDS_DISABLE or not ODDS_API_KEY):
         cached = cache.get(_ckey("odds", sport_key, "upcoming", ALL_MARKETS))
+        evt = None
         if cached:
             events, _ = cached
             for ev in events:
                 if str(ev.id) == str(event_id):
-                    return _sandbox_player_markets_for_sport(ev, sport_key, req)
-        tmp = APIEvent(id=str(event_id), sport_key=sport_key, sport_title=HUMAN_TITLES.get(sport_key, sport_key),
-                       commence_time="", home_team="Home", away_team="Away", bookmakers=[])
-        return _sandbox_player_markets_for_sport(tmp, sport_key, req)
+                    evt = ev
+                    break
+        if not evt:
+            evt = APIEvent(id=str(event_id), sport_key=sport_key, sport_title=HUMAN_TITLES.get(sport_key, sport_key),
+                           commence_time="", home_team="Home", away_team="Away", bookmakers=[])
+        mkts = _model_props_for_event(evt, sport_key, req) or _sandbox_player_markets_for_sport(evt, sport_key, req)
+        return mkts
     # Reuse fetcher but with allow_props True and zero team markets
     async def _do():
         async with httpx.AsyncClient() as http:
