@@ -616,6 +616,8 @@ SPORT_MAP = {
 
     "ncaa_football": "americanfootball_ncaaf",      # important: your app uses "ncaa_football"
     "americanfootball_ncaaf": "americanfootball_ncaaf",
+    "ncaaf": "americanfootball_ncaaf",
+    "cfb": "americanfootball_ncaaf",
 
     "mlb": "baseball_mlb",
     "baseball_mlb": "baseball_mlb",
@@ -719,13 +721,34 @@ def _sandbox_player_markets_for_sport(ev: APIEvent, sport_key: str, wanted: list
     away_names = [f"{(ev.away_team or 'Away').split()[0]} Star {i}" for i in range(1, 3)]
     names = home_names + away_names
     if sport_key == "basketball_nba":
-        base = {"player_points": (18, 35), "player_rebounds": (4, 12), "player_assists": (3, 10), "player_threes": (1, 5)}
-    elif sport_key in ("americanfootball_nfl","americanfootball_ncaaf"):
-        base = {"player_pass_yds": (190, 320), "player_rush_yds": (35, 95), "player_receptions": (3, 8), "player_receiving_yds": (30, 95)}
+        base = {
+            "player_points": (18, 35),
+            "player_rebounds": (4, 12),
+            "player_assists": (3, 10),
+            "player_threes": (1, 5),
+        }
+    elif sport_key in ("americanfootball_nfl", "americanfootball_ncaaf"):
+        # Use OddsAPI-compliant keys
+        base = {
+            "player_pass_yds": (190, 320),
+            "player_rush_yds": (35, 95),
+            "player_receptions": (3, 8),
+            "player_reception_yds": (30, 95),
+        }
     elif sport_key == "baseball_mlb":
-        base = {"player_total_bases": (0.5, 2.5), "player_hits": (0.5, 1.5), "pitcher_strikeouts": (3.5, 7.5), "pitcher_outs": (15.5, 18.5)}
+        # Use batter_* and pitcher_* keys to match OddsAPI
+        base = {
+            "batter_total_bases": (0.5, 2.5),
+            "batter_hits": (0.5, 1.5),
+            "pitcher_strikeouts": (3.5, 7.5),
+            "pitcher_outs": (15.5, 18.5),
+        }
     elif sport_key == "icehockey_nhl":
-        base = {"player_shots_on_goal": (1.5, 3.5), "player_points": (0.5, 1.5), "player_goals": (0.5, 1.5)}
+        base = {
+            "player_shots_on_goal": (1.5, 3.5),
+            "player_points": (0.5, 1.5),
+            "player_goals": (0.5, 1.5),
+        }
     else:
         base = {}
     allowed = set(wanted) if wanted else set(base.keys())
@@ -1030,6 +1053,23 @@ async def fetch_odds_events(
         last_headers = hdrs
 
     # 3) If player markets requested, fetch per-event using /events/{id}/odds.
+
+    # Sandbox synth: if props were requested but upstream pull is disabled, synthesize
+    if FREE_SANDBOX and player_markets and merged_events and not allow_props:
+        for ev in merged_events:
+            synth = _sandbox_player_markets_for_sport(ev, sport_key, player_markets)
+            if synth:
+                if ev.bookmakers:
+                    ev.bookmakers[0] = APIBookmaker(
+                        key=ev.bookmakers[0].key or "sandbox",
+                        title=ev.bookmakers[0].title or "Sandbox",
+                        last_update=ev.bookmakers[0].last_update,
+                        markets=_merge_market_lists(ev.bookmakers[0].markets, synth),
+                    )
+                else:
+                    ev.bookmakers.append(
+                        APIBookmaker(key="sandbox", title="Sandbox", last_update="", markets=synth)
+                    )
     if allow_props and player_markets and merged_events:
         # Respect max_prop_events to avoid exploding request counts
         events_for_props = merged_events[:max(0, int(max_prop_events))] if max_prop_events > 0 else []
@@ -1687,6 +1727,18 @@ def build_signals_for_event(ev: APIEvent) -> List[CorrelationSignal]:
 def health():
     return {"ok": True, "version": "1.0.0"}
 
+# Backend feature toggles/meta endpoint
+@app.get("/api/meta")
+def api_meta():
+    return {
+        "free_sandbox": bool(FREE_SANDBOX),
+        "odds_pull_player_on_odds": bool(ODDS_PULL_PLAYER_ON_ODDS),
+        "odds_max_prop_events": int(ODDS_MAX_PROP_EVENTS),
+        "has_odds_api_key": bool(ODDS_API_KEY),
+        "has_cfbd_api_key": bool(CFBD_API_KEY),
+        "has_sportsdata_nfl_key": bool(SPORTSDATA_NFL_KEY),
+    }
+
 def _odds_impl(
     league: Optional[str],
     sport: Optional[str],
@@ -1939,7 +1991,13 @@ def api_corr(
                     return ev
         return None
 
-    sport_key = map_league_or_sport(league, sport) if (league or sport) else None
+    sport_key = None
+    if league or sport:
+        try:
+            sport_key = map_league_or_sport(league, sport)
+        except HTTPException:
+            # Unknown alias provided; fall back to None so we scan cache across all sports
+            sport_key = None
     ev = _scan_cached_for_event(sport_key)
 
     if not ev:
