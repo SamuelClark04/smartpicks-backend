@@ -22,43 +22,6 @@
 
 import os
 
-# --- BEGIN: market safety layer ---
-# Minimal per-sport allowlist (provider-compatible names). We’ll intersect with ODDS_MARKETS/Query.
-SPORT_ALLOWED_MARKETS = {
-    "basketball_nba": [
-        "h2h","spreads","totals",
-        "player_points","player_rebounds","player_assists","player_threes",
-        "player_steals","player_blocks","player_turnovers",
-        "player_points_rebounds_assists","player_points_rebounds","player_points_assists","player_rebounds_assists",
-    ],
-    "americanfootball_nfl": [
-        "h2h","spreads","totals",
-        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
-        "player_rush_yards","player_rush_attempts","player_rush_tds",
-        "player_receiving_yards","player_receptions","player_receiving_tds",
-        "player_longest_reception","player_longest_rush",
-    ],
-    "baseball_mlb": [
-        "h2h","spreads","totals",
-        "player_total_bases","player_hits","player_runs","player_rbis","player_home_runs","player_walks",
-        "player_strikeouts","pitcher_outs","pitcher_hits_allowed",
-    ],
-    "icehockey_nhl": [
-        "h2h","spreads","totals",
-        "player_points","player_goals","player_assists","player_shots_on_goal","goalie_saves",
-    ],
-    "americanfootball_ncaaf": [
-        "h2h","spreads","totals",
-        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
-        "player_rush_yards","player_rush_attempts","player_rush_tds",
-        "player_receiving_yards","player_receptions","player_receiving_tds",
-        "player_longest_reception","player_longest_rush",
-    ],
-}
-
-# Keep a process-local “learned unsupported” set so once a market 422s we stop asking for it.
-LEARNED_UNSUPPORTED = {}  # dict[str sport_key] -> set[str market]
-# --- END: market safety layer ---
 
 
 # --- BEGIN: market safety layer ---
@@ -72,26 +35,26 @@ SPORT_ALLOWED_MARKETS = {
     ],
     "americanfootball_nfl": [
         "h2h","spreads","totals",
-        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
-        "player_rush_yards","player_rush_attempts","player_rush_tds",
-        "player_receiving_yards","player_receptions","player_receiving_tds",
-        "player_longest_reception","player_longest_rush",
+        "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+        "player_rush_yds","player_rush_attempts","player_rush_tds",
+        "player_reception_yds","player_receptions","player_reception_tds",
+        "player_reception_longest","player_rush_longest",
     ],
     "baseball_mlb": [
         "h2h","spreads","totals",
-        "player_total_bases","player_hits","player_runs","player_rbis","player_home_runs","player_walks",
-        "player_strikeouts","pitcher_outs","pitcher_hits_allowed",
+        "batter_total_bases","batter_hits","batter_runs_scored","batter_rbis","batter_home_runs","batter_walks",
+        "batter_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
     ],
     "icehockey_nhl": [
         "h2h","spreads","totals",
-        "player_points","player_goals","player_assists","player_shots_on_goal","goalie_saves",
+        "player_points","player_goals","player_assists","player_shots_on_goal","player_total_saves",
     ],
     "americanfootball_ncaaf": [
         "h2h","spreads","totals",
-        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
-        "player_rush_yards","player_rush_attempts","player_rush_tds",
-        "player_receiving_yards","player_receptions","player_receiving_tds",
-        "player_longest_reception","player_longest_rush",
+        "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+        "player_rush_yds","player_rush_attempts","player_rush_tds",
+        "player_reception_yds","player_receptions","player_reception_tds",
+        "player_reception_longest","player_rush_longest",
     ],
 }
 
@@ -678,14 +641,14 @@ ALL_MARKETS = ",".join([
     "player_points","player_rebounds","player_assists","player_threes","player_steals","player_blocks","player_turnovers",
     "player_points_rebounds_assists","player_points_rebounds","player_points_assists","player_rebounds_assists",
     # NFL/CFB
-    "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
-    "player_rush_yards","player_rush_attempts","player_rush_tds","player_receiving_yards","player_receptions",
-    "player_receiving_tds","player_longest_reception","player_longest_rush",
+    "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+    "player_rush_yds","player_rush_attempts","player_rush_tds","player_reception_yds","player_receptions",
+    "player_reception_tds","player_reception_longest","player_rush_longest",
     # MLB
-    "player_hits","player_runs","player_rbis","player_home_runs","player_total_bases","player_walks",
-    "player_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
+    "batter_hits","batter_runs_scored","batter_rbis","batter_home_runs","batter_total_bases","batter_walks",
+    "batter_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
     # NHL
-    "player_shots_on_goal","player_goals","player_points","goalie_saves"
+    "player_shots_on_goal","player_goals","player_points","player_total_saves"
 ])
 
 # Per-sport market allowlists (to avoid 422 from The Odds API when requesting unsupported markets)
@@ -694,31 +657,30 @@ SPORT_MARKETS: Dict[str, List[str]] = {
         "h2h","spreads","totals",
         "player_points","player_rebounds","player_assists","player_threes",
         "player_steals","player_blocks","player_turnovers",
-        "player_points_rebounds_assists","player_points_rebounds",
-        "player_points_assists","player_rebounds_assists",
+        "player_points_rebounds_assists","player_points_rebounds","player_points_assists","player_rebounds_assists",
     ],
     "americanfootball_nfl": [
         "h2h","spreads","totals",
-        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
-        "player_rush_yards","player_rush_attempts","player_rush_tds",
-        "player_receiving_yards","player_receptions","player_receiving_tds",
-        "player_longest_reception","player_longest_rush",
+        "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+        "player_rush_yds","player_rush_attempts","player_rush_tds",
+        "player_reception_yds","player_receptions","player_reception_tds",
+        "player_reception_longest","player_rush_longest",
     ],
     "americanfootball_ncaaf": [
         "h2h","spreads","totals",
-        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
-        "player_rush_yards","player_rush_attempts","player_rush_tds",
-        "player_receiving_yards","player_receptions","player_receiving_tds",
-        "player_longest_reception","player_longest_rush",
+        "player_pass_yds","player_pass_attempts","player_pass_completions","player_pass_tds","player_pass_interceptions",
+        "player_rush_yds","player_rush_attempts","player_rush_tds",
+        "player_reception_yds","player_receptions","player_reception_tds",
+        "player_reception_longest","player_rush_longest",
     ],
     "baseball_mlb": [
         "h2h","spreads","totals",
-        "player_hits","player_runs","player_rbis","player_home_runs","player_total_bases","player_walks",
-        "player_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
+        "batter_total_bases","batter_hits","batter_runs_scored","batter_rbis","batter_home_runs","batter_walks",
+        "batter_strikeouts","pitcher_strikeouts","pitcher_outs","pitcher_hits_allowed",
     ],
     "icehockey_nhl": [
         "h2h","spreads","totals",
-        "player_shots_on_goal","player_goals","player_assists","player_points","goalie_saves",
+        "player_points","player_goals","player_assists","player_shots_on_goal","player_total_saves",
     ],
 }
 
@@ -879,17 +841,7 @@ async def fetch_odds_events(
                             or o.get("playerName")
                         )
                         if not _desc and _name.lower() in ("over", "under"):
-                                                                                                                # Filter requested markets by sport + learned unsupported + env override
-                                                        try:
-                                                            filtered_markets = _filter_markets_for_sport(markets_csv, sport_key)
-                                                        except Exception:
-                                                            filtered_markets = markets_csv
-# Filter requested markets by sport + learned unsupported + env override
-                            try:
-                                filtered_markets = _filter_markets_for_sport(markets_csv, sport_key)
-                            except Exception:
-                                filtered_markets = markets_csv
-for k in (
+                            for k in (
                                 "participant","runner","competitor","team",
                                 "participant_name","athlete","entity","label","selection",
                             ):
@@ -974,21 +926,12 @@ for k in (
                     print(f"[fetch_odds_events] 422 retry succeeded without bookmakers for chunk='{mk_chunk}'")
                 except HTTPException as e2:
                     print(f"[fetch_odds_events] Skipping unsupported markets chunk='{mk_chunk}' status=422 (retry failed {e2.status_code})")
-                    
-            # Learn unsupported markets for this sport to avoid future calls
-            try:
-                sk = sport_key
-                LEARNED_UNSUPPORTED.setdefault(sk, set()).update([m.strip() for m in mk_chunk.split(",") if m.strip()])
-            except Exception:
-                
-            # Learn unsupported markets for this sport to avoid future calls
-            try:
-                sk = sport_key
-                LEARNED_UNSUPPORTED.setdefault(sk, set()).update([m.strip() for m in mk_chunk.split(",") if m.strip()])
-            except Exception:
-                pass
-            pass
-            continue
+                # Learn unsupported markets for this sport to avoid future calls
+                try:
+                    LEARNED_UNSUPPORTED.setdefault(sport_key, set()).update([m.strip() for m in mk_chunk.split(",") if m.strip()])
+                except Exception:
+                    pass
+                continue
             else:
                 raise
 
@@ -1007,7 +950,7 @@ for k in (
     for ev in merged_events:
         for bk in ev.bookmakers:
             for mk in bk.markets:
-                if mk.key.startswith("player_") or mk.key.startswith("pitcher_"):
+                if mk.key.startswith("player_") or mk.key.startswith("pitcher_") or mk.key.startswith("batter_"):
                     have_player = True
                     break
             if have_player: break
@@ -1016,9 +959,9 @@ for k in (
     if not have_player:
         light_by_sport = {
             "basketball_nba": ["player_points","player_rebounds","player_assists","player_threes"],
-            "americanfootball_nfl": ["player_pass_yards","player_rush_yards","player_receiving_yards","player_receptions"],
-            "americanfootball_ncaaf": ["player_pass_yards","player_rush_yards","player_receiving_yards","player_receptions"],
-            "baseball_mlb": ["player_total_bases","player_hits","player_home_runs","pitcher_strikeouts","pitcher_outs"],
+            "americanfootball_nfl": ["player_pass_yds","player_rush_yds","player_reception_yds","player_receptions"],
+            "americanfootball_ncaaf": ["player_pass_yds","player_rush_yds","player_reception_yds","player_receptions"],
+            "baseball_mlb": ["batter_total_bases","batter_hits","batter_home_runs","pitcher_strikeouts","pitcher_outs"],
             "icehockey_nhl": ["player_shots_on_goal","player_points","player_goals","player_assists"],
         }
         light = light_by_sport.get(sport_key, [])
