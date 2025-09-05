@@ -21,6 +21,84 @@
 #   (NFL/MLB/NHL/CFB adapters stubbed so UI stays happy; expand when ready.)
 
 import os
+
+# --- BEGIN: market safety layer ---
+# Minimal per-sport allowlist (provider-compatible names). We’ll intersect with ODDS_MARKETS/Query.
+SPORT_ALLOWED_MARKETS = {
+    "basketball_nba": [
+        "h2h","spreads","totals",
+        "player_points","player_rebounds","player_assists","player_threes",
+        "player_steals","player_blocks","player_turnovers",
+        "player_points_rebounds_assists","player_points_rebounds","player_points_assists","player_rebounds_assists",
+    ],
+    "americanfootball_nfl": [
+        "h2h","spreads","totals",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_receiving_tds",
+        "player_longest_reception","player_longest_rush",
+    ],
+    "baseball_mlb": [
+        "h2h","spreads","totals",
+        "player_total_bases","player_hits","player_runs","player_rbis","player_home_runs","player_walks",
+        "player_strikeouts","pitcher_outs","pitcher_hits_allowed",
+    ],
+    "icehockey_nhl": [
+        "h2h","spreads","totals",
+        "player_points","player_goals","player_assists","player_shots_on_goal","goalie_saves",
+    ],
+    "americanfootball_ncaaf": [
+        "h2h","spreads","totals",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_receiving_tds",
+        "player_longest_reception","player_longest_rush",
+    ],
+}
+
+# Keep a process-local “learned unsupported” set so once a market 422s we stop asking for it.
+LEARNED_UNSUPPORTED = {}  # dict[str sport_key] -> set[str market]
+# --- END: market safety layer ---
+
+
+# --- BEGIN: market safety layer ---
+# Minimal per-sport allowlist (provider-compatible names). We’ll intersect with ODDS_MARKETS/Query.
+SPORT_ALLOWED_MARKETS = {
+    "basketball_nba": [
+        "h2h","spreads","totals",
+        "player_points","player_rebounds","player_assists","player_threes",
+        "player_steals","player_blocks","player_turnovers",
+        "player_points_rebounds_assists","player_points_rebounds","player_points_assists","player_rebounds_assists",
+    ],
+    "americanfootball_nfl": [
+        "h2h","spreads","totals",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_receiving_tds",
+        "player_longest_reception","player_longest_rush",
+    ],
+    "baseball_mlb": [
+        "h2h","spreads","totals",
+        "player_total_bases","player_hits","player_runs","player_rbis","player_home_runs","player_walks",
+        "player_strikeouts","pitcher_outs","pitcher_hits_allowed",
+    ],
+    "icehockey_nhl": [
+        "h2h","spreads","totals",
+        "player_points","player_goals","player_assists","player_shots_on_goal","goalie_saves",
+    ],
+    "americanfootball_ncaaf": [
+        "h2h","spreads","totals",
+        "player_pass_yards","player_pass_attempts","player_pass_completions","player_pass_tds","player_interceptions",
+        "player_rush_yards","player_rush_attempts","player_rush_tds",
+        "player_receiving_yards","player_receptions","player_receiving_tds",
+        "player_longest_reception","player_longest_rush",
+    ],
+}
+
+# Keep a process-local “learned unsupported” set so once a market 422s we stop asking for it.
+LEARNED_UNSUPPORTED = {}  # dict[str sport_key] -> set[str market]
+# --- END: market safety layer ---
+
 import time
 import json
 import hashlib
@@ -801,7 +879,17 @@ async def fetch_odds_events(
                             or o.get("playerName")
                         )
                         if not _desc and _name.lower() in ("over", "under"):
-                            for k in (
+                                                                                                                # Filter requested markets by sport + learned unsupported + env override
+                                                        try:
+                                                            filtered_markets = _filter_markets_for_sport(markets_csv, sport_key)
+                                                        except Exception:
+                                                            filtered_markets = markets_csv
+# Filter requested markets by sport + learned unsupported + env override
+                            try:
+                                filtered_markets = _filter_markets_for_sport(markets_csv, sport_key)
+                            except Exception:
+                                filtered_markets = markets_csv
+for k in (
                                 "participant","runner","competitor","team",
                                 "participant_name","athlete","entity","label","selection",
                             ):
@@ -886,7 +974,21 @@ async def fetch_odds_events(
                     print(f"[fetch_odds_events] 422 retry succeeded without bookmakers for chunk='{mk_chunk}'")
                 except HTTPException as e2:
                     print(f"[fetch_odds_events] Skipping unsupported markets chunk='{mk_chunk}' status=422 (retry failed {e2.status_code})")
-                    continue
+                    
+            # Learn unsupported markets for this sport to avoid future calls
+            try:
+                sk = sport_key
+                LEARNED_UNSUPPORTED.setdefault(sk, set()).update([m.strip() for m in mk_chunk.split(",") if m.strip()])
+            except Exception:
+                
+            # Learn unsupported markets for this sport to avoid future calls
+            try:
+                sk = sport_key
+                LEARNED_UNSUPPORTED.setdefault(sk, set()).update([m.strip() for m in mk_chunk.split(",") if m.strip()])
+            except Exception:
+                pass
+            pass
+            continue
             else:
                 raise
 
