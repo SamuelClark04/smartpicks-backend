@@ -20,7 +20,18 @@
 # - /api/signals builds NBA H2H boosts from the returned player lines.
 #   (NFL/MLB/NHL/CFB adapters stubbed so UI stays happy; expand when ready.)
 
+
 import os
+
+# ---- SmartPicks odds quota guards ----
+TEAM_MARKETS = "h2h,spreads,totals"
+ODDS_PULL_PLAYER_ON_ODDS = os.getenv("ODDS_PULL_PLAYER_ON_ODDS", "0").strip() in ("1","true","yes")
+ODDS_COOLDOWN_SEC = int(os.getenv("ODDS_COOLDOWN_SEC", "120").strip() or 120)
+ODDS_MAX_PROP_EVENTS = int(os.getenv("ODDS_MAX_PROP_EVENTS", "0").strip() or 0)
+
+FREE_SANDBOX = os.getenv("FREE_SANDBOX", "0").strip() == "1"
+ODDS_DISABLE = os.getenv("ODDS_DISABLE", "0").strip() == "1"
+
 
 
 
@@ -76,6 +87,7 @@ class SPBase(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 import sqlite3
 import gzip
+import random
 from pathlib import Path
 import urllib.parse
 from contextlib import contextmanager
@@ -271,6 +283,8 @@ class TTLCache:
                 self.store.pop(oldest_key, None)
         self.store[key] = (time.time(), value)
 
+# Track last upstream fetch per sport to avoid burst refetches
+_last_fetch_ts: Dict[str, float] = {}
 cache = TTLCache(ttl_seconds=600)
 # === Odds disk-cache helpers (gzipped JSON in SQLite) ===
 def _odds_cache_key(sport_key: str, ymd: str, markets_csv: str, regions: str, books: str) -> tuple:
@@ -684,6 +698,89 @@ SPORT_MARKETS: Dict[str, List[str]] = {
     ],
 }
 
+# ---------- SANDBOX (free fallback) ----------
+def _sandbox_rng(seed_text: str) -> random.Random:
+    h = hashlib.md5(seed_text.encode()).hexdigest()
+    return random.Random(int(h[:8], 16))
+
+def _mk_ou_market(key: str, who: str, line: float, price: int = -115) -> APIMarket:
+    return APIMarket(
+        key=key,
+        outcomes=[
+            APIOutcome(name="Over", price=price, point=round(line, 1), description=who, model_prob=0.5),
+            APIOutcome(name="Under", price=price, point=round(line, 1), description=who, model_prob=0.5),
+        ],
+    )
+
+def _sandbox_player_markets_for_sport(ev: APIEvent, sport_key: str, wanted: list[str]) -> list[APIMarket]:
+    rng = _sandbox_rng(ev.id + sport_key)
+    mkts: list[APIMarket] = []
+    home_names = [f"{(ev.home_team or 'Home').split()[0]} Star {i}" for i in range(1, 3)]
+    away_names = [f"{(ev.away_team or 'Away').split()[0]} Star {i}" for i in range(1, 3)]
+    names = home_names + away_names
+    if sport_key == "basketball_nba":
+        base = {"player_points": (18, 35), "player_rebounds": (4, 12), "player_assists": (3, 10), "player_threes": (1, 5)}
+    elif sport_key in ("americanfootball_nfl","americanfootball_ncaaf"):
+        base = {"player_pass_yds": (190, 320), "player_rush_yds": (35, 95), "player_receptions": (3, 8), "player_receiving_yds": (30, 95)}
+    elif sport_key == "baseball_mlb":
+        base = {"player_total_bases": (0.5, 2.5), "player_hits": (0.5, 1.5), "pitcher_strikeouts": (3.5, 7.5), "pitcher_outs": (15.5, 18.5)}
+    elif sport_key == "icehockey_nhl":
+        base = {"player_shots_on_goal": (1.5, 3.5), "player_points": (0.5, 1.5), "player_goals": (0.5, 1.5)}
+    else:
+        base = {}
+    allowed = set(wanted) if wanted else set(base.keys())
+    for mk, (lo, hi) in base.items():
+        if mk not in allowed:
+            continue
+        for n in names:
+            line = rng.uniform(lo, hi)
+            mkts.append(_mk_ou_market(mk, n, line))
+    return mkts
+
+def _sandbox_team_markets(ev: APIEvent) -> list[APIMarket]:
+    rng = _sandbox_rng(ev.id)
+    price_home = -120 if rng.random() > 0.5 else 110
+    price_away = 100 if price_home == -120 else -105
+    h2h = APIMarket(key="h2h", outcomes=[
+        APIOutcome(name=ev.home_team, price=price_home),
+        APIOutcome(name=ev.away_team, price=price_away),
+    ])
+    spread = round(rng.uniform(-6, 6), 1)
+    sp = APIMarket(key="spreads", outcomes=[
+        APIOutcome(name=ev.home_team, price=-110, point=spread),
+        APIOutcome(name=ev.away_team, price=-110, point=-spread),
+    ])
+    total = round(rng.uniform(190, 235), 1)
+    tot = APIMarket(key="totals", outcomes=[
+        APIOutcome(name="Over", price=-110, point=total),
+        APIOutcome(name="Under", price=-110, point=total),
+    ])
+    return [h2h, sp, tot]
+
+def _sandbox_events_for_sport(sport_key: str) -> list[APIEvent]:
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    pairs = {
+        "basketball_nba": [("Lakers", "Warriors"), ("Celtics", "Heat")],
+        "americanfootball_nfl": [("Chiefs", "Ravens"), ("Bills", "Jets")],
+        "americanfootball_ncaaf": [("Georgia", "Alabama"), ("Ohio State", "Michigan")],
+        "baseball_mlb": [("Yankees", "Red Sox"), ("Dodgers", "Giants")],
+        "icehockey_nhl": [("Maple Leafs", "Canadiens"), ("Rangers", "Bruins")],
+    }.get(sport_key, [("Home", "Away"), ("East", "West")])
+    evs: list[APIEvent] = []
+    for idx, (home, away) in enumerate(pairs):
+        raw_id = f"{sport_key}|{home}|{away}|{now.date()}|{idx}"
+        evs.append(APIEvent(
+            id=_stable_id(raw_id),
+            sport_key=sport_key,
+            sport_title=HUMAN_TITLES.get(sport_key, sport_key),
+            commence_time=(now + timedelta(hours=2 + idx)).isoformat().replace("+00:00","Z"),
+            home_team=home, away_team=away, bookmakers=[]
+        ))
+    return evs
+
+
+
 def _filter_markets_for_sport(requested_csv: str, sport_key: str) -> str:
     """Intersect requested markets with sport-allowed list to prevent upstream 422s."""
     requested = [m.strip() for m in (requested_csv or "").split(",") if m.strip()]
@@ -764,8 +861,11 @@ def _american_to_implied(price: float) -> float:
         return 0.0
 
 def normalize_market_param(market: Optional[str]) -> str:
-    if not market or market.lower() == "all":
-        return ALL_MARKETS
+    if not market:
+        return TEAM_MARKETS
+    if market.lower() == "all":
+        # Protect your quota by default: only team markets unless explicitly enabled
+        return ALL_MARKETS if ODDS_PULL_PLAYER_ON_ODDS else TEAM_MARKETS
     return market
 
 def map_league_or_sport(league: Optional[str], sport: Optional[str]) -> str:
@@ -782,7 +882,9 @@ async def fetch_odds_events(
     http: httpx.AsyncClient,
     sport_key: str,
     markets_csv: str,
-    bookmakers: Optional[List[str]] = None
+    bookmakers: Optional[List[str]] = None,
+    allow_props: bool = False,
+    max_prop_events: int = 0,
 ) -> Tuple[List[APIEvent], Dict[str, str]]:
     """
     Calls The Odds API and normalizes results into your Swift JSON shape.
@@ -927,8 +1029,10 @@ async def fetch_odds_events(
         merged_events = _merge_events(merged_events, evs)
         last_headers = hdrs
 
-    # 3) If player markets requested, fetch per-event using /events/{id}/odds
-    if player_markets and merged_events:
+    # 3) If player markets requested, fetch per-event using /events/{id}/odds.
+    if allow_props and player_markets and merged_events:
+        # Respect max_prop_events to avoid exploding request counts
+        events_for_props = merged_events[:max(0, int(max_prop_events))] if max_prop_events > 0 else []
         per_event_url_tpl = f"{ODDS_API_BASE}/sports/{sport_key}/events/{{eid}}/odds"
         player_chunks = _split_markets(",".join(player_markets), chunk_size=3)
 
@@ -958,7 +1062,7 @@ async def fetch_odds_events(
             return mkts
 
         # For each event, pull player markets and merge into that event's bookmakers
-        for ev in list(merged_events):
+        for ev in list(events_for_props):
             player_merged_by_book: Dict[str, List[APIMarket]] = {}
             for mk_chunk in player_chunks:
                 try:
@@ -981,7 +1085,12 @@ async def fetch_odds_events(
                 player_merged_by_book["aggregated"] = _merge_market_lists(player_merged_by_book["aggregated"], mkts)
 
             # Attach/merge into event's bookmakers
-            if player_merged_by_book:
+            
+            if not player_merged_by_book and FREE_SANDBOX:
+                synth = _sandbox_player_markets_for_sport(ev, sport_key, player_markets)
+                if synth:
+                    player_merged_by_book["aggregated"] = synth
+if player_merged_by_book:
                 agg_markets = player_merged_by_book["aggregated"]
                 # if there is already a bookmaker, append player markets to the first one; otherwise create one
                 if ev.bookmakers:
@@ -1584,18 +1693,45 @@ def _odds_impl(
     response: Response
 ):
     sport_key = map_league_or_sport(league, sport)
+    # Use a single shared "upcoming" cache key to avoid refetching per date.
+    # We filter by date AFTER cache to cut API calls and 429s dramatically.
+    effective_date_key = "upcoming"
     markets_csv = normalize_market_param(market)
-    ck = _ckey("odds", sport_key, date or "upcoming", markets_csv, ODDS_REGIONS)
+    ck = _ckey("odds", sport_key, effective_date_key, markets_csv, ODDS_REGIONS)
+
+    # Cooldown: if we fetched this sport very recently, avoid another upstream call
+    now = time.time()
+    last_ts = _last_fetch_ts.get(sport_key)
+    if last_ts and now - last_ts < ODDS_COOLDOWN_SEC:
+        cached = cache.get(ck)
+        if cached is not None:
+            events, hdrs = cached
+            rem = hdrs.get("x-requests-remaining") if isinstance(hdrs, dict) else None
+            if rem is not None:
+                response.headers["x-requests-remaining"] = str(rem)
+            response.headers["x-cache"] = "hit"
+            response.headers["x-mode"] = "team-only" if markets_csv == TEAM_MARKETS else "custom"
+            return filter_by_date(events, date)
+        disk_evs = _odds_cache_get(sport_key, "upcoming", markets_csv, ODDS_REGIONS, ",".join(DEFAULT_BOOKMAKERS))
+        if disk_evs:
+            try:
+                events = [APIEvent(**e) for e in disk_evs]
+                cache.set(ck, (events, {}))
+                response.headers["x-cache"] = "hit"
+                response.headers["x-mode"] = "team-only" if markets_csv == TEAM_MARKETS else "custom"
+                return filter_by_date(events, date)
+            except Exception:
+                pass
 
     cached = cache.get(ck)
     if cached is not None:
         # cached is (events, headers_dict)
         events, hdrs = cached
-        # forward credits header if we cached it
         rem = hdrs.get("x-requests-remaining") if isinstance(hdrs, dict) else None
         if rem is not None:
             response.headers["x-requests-remaining"] = str(rem)
-        # server-side date filter is optional; app also filters by local day
+        response.headers["x-cache"] = "hit"
+        response.headers["x-mode"] = "team-only" if markets_csv == TEAM_MARKETS else "custom"
         return filter_by_date(events, date)
 
     # Try the on-disk snapshot cache for 'upcoming' (we store by 'upcoming', app also filters by date)
@@ -1604,22 +1740,67 @@ def _odds_impl(
         try:
             events = [APIEvent(**e) for e in disk_evs]
             cache.set(ck, (events, {}))
+            response.headers["x-cache"] = "hit"
+            response.headers["x-mode"] = "team-only" if markets_csv == TEAM_MARKETS else "custom"
             return filter_by_date(events, date)
         except Exception:
             pass
 
+    # If we're out of credits or key is missing, serve cached snapshot (HTTP 200) instead of failing.
+    if not ODDS_API_KEY:
+        # Return whatever we have (memory cache already checked; disk checked above)
+        return filter_by_date([], date)
+
     async def _do_fetch():
         async with httpx.AsyncClient() as http:
-            events, hdrs = await fetch_odds_events(http, sport_key, markets_csv)
+            # Only pull player props during /api/odds if explicitly enabled via env
+            events, hdrs = await fetch_odds_events(
+                http, sport_key, markets_csv,
+                allow_props=ODDS_PULL_PLAYER_ON_ODDS,
+                max_prop_events=ODDS_MAX_PROP_EVENTS,
+            )
             cache.set(ck, (events, hdrs))
             rem = hdrs.get("x-requests-remaining")
             if rem is not None:
                 response.headers["x-requests-remaining"] = str(rem)
+            _last_fetch_ts[sport_key] = time.time()
+            response.headers["x-cache"] = "refresh"
+            response.headers["x-mode"] = "team-only" if markets_csv == TEAM_MARKETS else "custom"
             return filter_by_date(events, date)
 
     # Run fetch (sync wrapper since FastAPI lets us call async from sync via anyio)
     import anyio
-    return anyio.run(_do_fetch)
+    try:
+        return anyio.run(_do_fetch)
+    except HTTPException as e:
+        # On Unauthorized or Too Many Requests, fall back to latest cached snapshot (serve 200)
+        if e.status_code in (401, 429):
+
+            if FREE_SANDBOX:
+                events = _sandbox_events_for_sport(sport_key)
+                for ev in events:
+                    ev.bookmakers = [APIBookmaker(key="sandbox", title="Sandbox", last_update="", markets=_sandbox_team_markets(ev))]
+                cache.set(ck, (events, {"x-requests-remaining": "sandbox"}))
+                try:
+                    _odds_cache_put(sport_key, "upcoming", markets_csv, ODDS_REGIONS, ",".join(DEFAULT_BOOKMAKERS), events)
+                except Exception as _e:
+                    print(f"[odds_cache_put sandbox429] non-fatal: {_e}")
+                response.headers["x-cache"] = "sandbox"
+                response.headers["x-mode"] = "team-only" if markets_csv == TEAM_MARKETS else "custom"
+                return filter_by_date(events, date)
+            disk_evs = _odds_cache_get(sport_key, "upcoming", markets_csv, ODDS_REGIONS, ",".join(DEFAULT_BOOKMAKERS))
+            if disk_evs:
+                try:
+                    events = [APIEvent(**ev) for ev in disk_evs]
+                    cache.set(ck, (events, {}))
+                    response.headers["x-cache"] = "hit"
+                    response.headers["x-mode"] = "team-only" if markets_csv == TEAM_MARKETS else "custom"
+                    return filter_by_date(events, date)
+                except Exception:
+                    pass
+            # As a last resort, return an empty list so the app doesn't crash
+            return []
+        raise
 
 @app.get("/api/odds", response_model=List[APIEvent])
 def api_odds(
@@ -1823,7 +2004,6 @@ def api_corr(
         boost=0.03,
         reason="Game-wide pace/injury tailwind (bounded)"
     ))
-
     # Optional: fold in any precomputed correlations from DB (bounded window)
     try:
         with db_conn() as conn:
@@ -1848,12 +2028,7 @@ def api_corr(
         print(f"/api/corr db merge skipped: {_e}")
 
     # Cap boosts conservatively and de-duplicate by id
-    capped: Dict[str, CorrelationSignal] = {}
-    # (safety) cap boosts to ±0.08
-    for s in sigs:
-        s.boost = float(max(-0.08, min(0.08, s.boost)))
-        capped[s.id] = s
-    dedup = {}
+    dedup: Dict[str, CorrelationSignal] = {}
     for s in sigs:
         s.boost = float(max(-0.08, min(0.08, s.boost)))
         dedup[s.id] = s
@@ -1884,3 +2059,65 @@ def admin_prune(max_age_days: int = 14):
         return {"ok": True, "deleted_older_than_days": max_age_days}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ------------------------------------------------------------
+# /api/props: Fetch per-event player prop markets (quota-friendly)
+# ------------------------------------------------------------
+@app.get("/api/props", response_model=List[APIMarket])
+def api_props(
+    response: Response,
+    event_id: str = Query(...),
+    league: Optional[str] = Query(None),
+    sport: Optional[str] = Query(None),
+    markets: Optional[str] = Query(None, description="CSV of player_ markets; defaults per sport"),
+):
+    """Fetch player prop markets for a single event only (quota-friendly)."""
+    sport_key = map_league_or_sport(league, sport)
+    # Default per-sport player markets (small sets)
+    default_players = {
+        "basketball_nba": ["player_points","player_rebounds","player_assists","player_threes"],
+        "americanfootball_nfl": [
+            "player_pass_yds","player_rush_yds","player_receiving_yds","player_receptions"
+        ],
+        "baseball_mlb": ["player_total_bases","player_hits","pitcher_strikeouts","pitcher_outs"],
+        "icehockey_nhl": ["player_shots_on_goal","player_points","player_goals"],
+        "americanfootball_ncaaf": [
+            "player_pass_yds","player_rush_yds","player_receiving_yds","player_receptions"
+        ],
+    }
+    req = [m.strip() for m in (markets or "").split(",") if m and m.strip()]
+    if not req:
+        req = default_players.get(sport_key, [])
+
+    if FREE_SANDBOX and (ODDS_DISABLE or not ODDS_API_KEY):
+        cached = cache.get(_ckey("odds", sport_key, "upcoming", ALL_MARKETS))
+        if cached:
+            events, _ = cached
+            for ev in events:
+                if str(ev.id) == str(event_id):
+                    return _sandbox_player_markets_for_sport(ev, sport_key, req)
+        tmp = APIEvent(id=str(event_id), sport_key=sport_key, sport_title=HUMAN_TITLES.get(sport_key, sport_key),
+                       commence_time="", home_team="Home", away_team="Away", bookmakers=[])
+        return _sandbox_player_markets_for_sport(tmp, sport_key, req)
+    # Reuse fetcher but with allow_props True and zero team markets
+    async def _do():
+        async with httpx.AsyncClient() as http:
+            # We call event-specific endpoint chunks through fetcher by crafting markets_csv = ",".join(req)
+            events, _ = await fetch_odds_events(
+                http, sport_key, ",".join([*set([mk for mk in req]) ,"h2h"]) , # ensure event ids available
+                allow_props=True,
+                max_prop_events=1,
+            )
+            # find the event and return only its player markets from the first bookmaker
+            for ev in events:
+                if str(ev.id) == str(event_id):
+                    if not ev.bookmakers:
+                        return []
+                    mkts = [m for m in ev.bookmakers[0].markets if m.key.startswith("player_")]
+                    return mkts
+            return []
+    import anyio
+    mkts = anyio.run(_do)
+    response.headers["x-cache"] = "props"
+    return mkts
