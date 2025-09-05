@@ -764,20 +764,29 @@ def _sandbox_team_markets(ev: APIEvent) -> list[APIMarket]:
     rng = _sandbox_rng(ev.id)
     price_home = -120 if rng.random() > 0.5 else 110
     price_away = 100 if price_home == -120 else -105
-    h2h = APIMarket(key="h2h", outcomes=[
-        APIOutcome(name=ev.home_team, price=price_home),
-        APIOutcome(name=ev.away_team, price=price_away),
-    ])
+    h2h = APIMarket(
+        key="h2h",
+        outcomes=[
+            APIOutcome(name=ev.home_team, price=price_home),
+            APIOutcome(name=ev.away_team, price=price_away),
+        ],
+    )
     spread = round(rng.uniform(-6, 6), 1)
-    sp = APIMarket(key="spreads", outcomes=[
-        APIOutcome(name=ev.home_team, price=-110, point=spread),
-        APIOutcome(name=ev.away_team, price=-110, point=-spread),
-    ])
+    sp = APIMarket(
+        key="spreads",
+        outcomes=[
+            APIOutcome(name=ev.home_team, price=-110, point=spread),
+            APIOutcome(name=ev.away_team, price=-110, point=-spread),
+        ],
+    )
     total = round(rng.uniform(190, 235), 1)
-    tot = APIMarket(key="totals", outcomes=[
-        APIOutcome(name="Over", price=-110, point=total),
-        APIOutcome(name="Under", price=-110, point=total),
-    ])
+    tot = APIMarket(
+        key="totals",
+        outcomes=[
+            APIOutcome(name="Over", price=-110, point=total),
+            APIOutcome(name="Under", price=-110, point=total),
+        ],
+    )
     return [h2h, sp, tot]
 
 def _sandbox_events_for_sport(sport_key: str) -> list[APIEvent]:
@@ -1751,6 +1760,34 @@ def _odds_impl(
     # We filter by date AFTER cache to cut API calls and 429s dramatically.
     effective_date_key = "upcoming"
     markets_csv = normalize_market_param(market)
+    # --- FREE SANDBOX SHORT-CIRCUIT ---
+    # If FREE_SANDBOX=1, always return deterministic fake events/markets so the
+    # app UI can be exercised without burning Odds API credits.
+    if FREE_SANDBOX:
+        events = _sandbox_events_for_sport(sport_key)
+        req_markets = [m.strip() for m in (markets_csv or "").split(",") if m.strip()]
+        allowed = set(SPORT_MARKETS.get(sport_key, ["h2h","spreads","totals"]))
+        team_set = {"h2h","spreads","totals"}
+        want_props = (market or "").lower() == "all" or any(m not in team_set for m in req_markets)
+        player_wanted = [m for m in allowed if m not in team_set] if want_props else []
+        for ev in events:
+            team_mkts = _sandbox_team_markets(ev)
+            bk = APIBookmaker(key="sandbox", title="Sandbox", last_update="", markets=team_mkts)
+            if player_wanted:
+                prop_mkts = _sandbox_player_markets_for_sport(ev, sport_key, player_wanted)
+                if prop_mkts:
+                    bk = APIBookmaker(
+                        key=bk.key,
+                        title=bk.title,
+                        last_update=bk.last_update,
+                        markets=_merge_market_lists(bk.markets, prop_mkts),
+                    )
+            ev.bookmakers = [bk]
+        ck = _ckey("odds", sport_key, "upcoming", markets_csv, ODDS_REGIONS)
+        cache.set(ck, (events, {"x-requests-remaining": "sandbox"}))
+        response.headers["x-cache"] = "sandbox"
+        response.headers["x-mode"] = "team+props" if player_wanted else "team-only"
+        return filter_by_date(events, date)
     ck = _ckey("odds", sport_key, effective_date_key, markets_csv, ODDS_REGIONS)
 
     # Cooldown: if we fetched this sport very recently, avoid another upstream call
