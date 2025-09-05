@@ -1858,13 +1858,15 @@ def api_signals(
 
     # Try to find the event in cache first (across known sports if necessary)
     def _scan_cached_for_event(skey: Optional[str]) -> Optional[APIEvent]:
-        keys_to_check = []
+        keys_to_check: List[str] = []
+        def _add_keys_for_sport(sk: str):
+            keys_to_check.append(_ckey("odds", sk, "upcoming", TEAM_MARKETS))
+            keys_to_check.append(_ckey("odds", sk, "upcoming", ALL_MARKETS))
         if skey:
-            keys_to_check.append(_ckey("odds", skey, "upcoming", ALL_MARKETS))
+            _add_keys_for_sport(skey)
         else:
             for sk in ("basketball_nba","americanfootball_nfl","americanfootball_ncaaf","baseball_mlb","icehockey_nhl"):
-                keys_to_check.append(_ckey("odds", sk, "upcoming", ALL_MARKETS))
-
+                _add_keys_for_sport(sk)
         for ck in keys_to_check:
             cached = cache.get(ck)
             if not cached:
@@ -1891,7 +1893,12 @@ def api_signals(
                 return build_signals_for_event(e)
         return []  # not fatal; app treats signals as optional
 
-    return anyio.run(_ensure_fetch_and_find)
+    try:
+        return anyio.run(_ensure_fetch_and_find)
+    except HTTPException as e:
+        if e.status_code in (401, 429):
+            return []
+        raise
 
 
 # ------------------------------------------------------------
@@ -1909,15 +1916,19 @@ def api_corr(
     Lightweight, on-demand correlations that the app can call after a leg is added.
     - Reuses the same CorrelationSignal schema as /api/signals so the UI can merge them.
     - Conservative caps (±0.08) to avoid over-influence.
+    - **Fix:** Never bubble upstream 401/429; fall back to cache or return [] so UI doesn't error.
     """
-    # helper: find event in cache (mirrors logic inside /api/signals)
     def _scan_cached_for_event(skey: Optional[str]) -> Optional[APIEvent]:
-        keys_to_check = []
+        # Try both TEAM_MARKETS and ALL_MARKETS cache keys, because /api/odds may have been cached with either
+        keys_to_check: List[str] = []
+        def _add_keys_for_sport(sk: str):
+            keys_to_check.append(_ckey("odds", sk, "upcoming", TEAM_MARKETS))
+            keys_to_check.append(_ckey("odds", sk, "upcoming", ALL_MARKETS))
         if skey:
-            keys_to_check.append(_ckey("odds", skey, "upcoming", ALL_MARKETS))
+            _add_keys_for_sport(skey)
         else:
             for sk in ("basketball_nba","americanfootball_nfl","americanfootball_ncaaf","baseball_mlb","icehockey_nhl"):
-                keys_to_check.append(_ckey("odds", sk, "upcoming", ALL_MARKETS))
+                _add_keys_for_sport(sk)
         for ck in keys_to_check:
             cached = cache.get(ck)
             if not cached:
@@ -1932,7 +1943,8 @@ def api_corr(
     ev = _scan_cached_for_event(sport_key)
 
     if not ev:
-        # Best-effort fetch of upcoming for the guessed sport, then try to find the event
+        # Best-effort fetch of upcoming for the guessed sport, then try to find the event.
+        # If upstream denies (401/429), just return [] (no error to the client).
         import anyio, httpx as _hx
         async def _ensure_fetch_and_find() -> Optional[APIEvent]:
             skey = sport_key or "basketball_nba"
@@ -1943,7 +1955,13 @@ def api_corr(
                 if str(e.id) == str(event_id):
                     return e
             return None
-        ev = anyio.run(_ensure_fetch_and_find)
+        try:
+            ev = anyio.run(_ensure_fetch_and_find)
+        except HTTPException as e:
+            if e.status_code in (401, 429):
+                # Upstream not available; do not error the client.
+                return []
+            raise
 
     if not ev:
         return []
@@ -2006,6 +2024,7 @@ def api_corr(
         boost=0.03,
         reason="Game-wide pace/injury tailwind (bounded)"
     ))
+
     # Optional: fold in any precomputed correlations from DB (bounded window)
     try:
         with db_conn() as conn:
@@ -2029,7 +2048,6 @@ def api_corr(
     except Exception as _e:
         print(f"/api/corr db merge skipped: {_e}")
 
-    # Cap boosts conservatively and de-duplicate by id
     dedup: Dict[str, CorrelationSignal] = {}
     for s in sigs:
         s.boost = float(max(-0.08, min(0.08, s.boost)))
